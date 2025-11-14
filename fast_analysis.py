@@ -45,17 +45,18 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Analyze arXiv metadata JSON file')
     parser.add_argument('file_path', nargs='?', default='./arxiv-metadata-oai-snapshot.json',
                         help='Path to the arXiv metadata JSON file (default: ./arxiv-metadata-oai-snapshot.json)')
-    
+    parser.add_argument('--cpu_count', type=int, default=cpu_count() // 4,
+                        help='Number of CPU cores to use (default: quarter of available cores)')
     args = parser.parse_args()
 
     file_path = args.file_path
 
     print(f"Analyzing file: {file_path}")
-    print(f"Using {cpu_count() // 4} CPU cores")
+    print(f"Using {args.cpu_count} CPU cores")
     print("Processing data in parallel...")
 
     # Process in parallel using imap_unordered (no pre-loading chunks)
-    with Pool(processes=cpu_count() // 4) as pool:
+    with Pool(processes=args.cpu_count) as pool:
         results = list(pool.imap_unordered(process_chunk, read_in_chunks(file_path), chunksize=1))
 
     # Merge results
@@ -79,7 +80,7 @@ if __name__ == '__main__':
     print(f"\n{'='*60}")
     print(f"Total articles: {total_articles:,}")
     print(f"Parse errors: {total_errors}")
-    print(f"Threshold (0.1%): {threshold:,.0f} articles")
+    print(f"Threshold: {threshold:,.0f} articles")
     if excluded_versions:
         print(f"Excluded version counts (>{threshold:,.0f}): {sorted(excluded_versions.keys())}")
     print(f"{'='*60}")
