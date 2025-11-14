@@ -5,6 +5,7 @@ from multiprocessing import Pool, cpu_count
 import matplotlib.pyplot as plt
 from functools import partial
 import argparse
+import os
 
 def process_chunk(lines):
     """Process a chunk of lines and return counters"""
@@ -131,8 +132,13 @@ if __name__ == '__main__':
         ax2.set_yticks(version_nums)
 
     plt.tight_layout()
-    plt.savefig('arxiv_analysis_fast.png', dpi=300, bbox_inches='tight')
-    print(f"\nSaved combined plot as 'arxiv_analysis_fast.png'")
+
+    # Create outputs directory if it doesn't exist
+    os.makedirs('outputs', exist_ok=True)
+
+    output_path = 'outputs/arxiv_analysis_fast.png'
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"\nSaved combined plot as '{output_path}'")
 
     # Summary stats
     print(f"\nSUMMARY")
@@ -143,4 +149,4 @@ if __name__ == '__main__':
     multi_version = sum(c for v, c in sorted_versions if v > 1)
     print(f"Multi-version articles (filtered): {multi_version:,} ({(multi_version/total_articles)*100:.2f}%)")
 
-    plt.show()
+    #plt.show()
