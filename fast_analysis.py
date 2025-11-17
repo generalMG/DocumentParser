@@ -52,13 +52,39 @@ if __name__ == '__main__':
 
     file_path = args.file_path
 
+    # Check if file exists
+    if not os.path.exists(file_path):
+        print(f"\n{'='*80}")
+        print(f"ERROR: File not found: {file_path}")
+        print(f"{'='*80}")
+        print("\nBefore running this script, you need to download the arXiv dataset:")
+        print("\n1. Visit: https://www.kaggle.com/datasets/Cornell-University/arxiv")
+        print("2. Download the 'arxiv-metadata-oai-snapshot.json' file")
+        print("3. Place it in the current directory or specify the path as an argument")
+        print("\nUsage examples:")
+        print(f"  python {os.path.basename(__file__)}")
+        print(f"  python {os.path.basename(__file__)} /path/to/arxiv-metadata-oai-snapshot.json")
+        print(f"  python {os.path.basename(__file__)} /path/to/file.json --cpu_count 8")
+        print(f"{'='*80}\n")
+        exit(1)
+
     print(f"Analyzing file: {file_path}")
     print(f"Using {args.cpu_count} CPU cores")
     print("Processing data in parallel...")
 
     # Process in parallel using imap_unordered (no pre-loading chunks)
-    with Pool(processes=args.cpu_count) as pool:
-        results = list(pool.imap_unordered(process_chunk, read_in_chunks(file_path), chunksize=1))
+    try:
+        with Pool(processes=args.cpu_count) as pool:
+            results = list(pool.imap_unordered(process_chunk, read_in_chunks(file_path), chunksize=1))
+    except FileNotFoundError:
+        print(f"\nERROR: File not found during processing: {file_path}")
+        exit(1)
+    except PermissionError:
+        print(f"\nERROR: Permission denied when reading file: {file_path}")
+        exit(1)
+    except Exception as e:
+        print(f"\nERROR: An unexpected error occurred while reading the file: {e}")
+        exit(1)
 
     # Merge results
     print("Merging results...")
