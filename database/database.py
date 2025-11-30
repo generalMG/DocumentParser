@@ -105,7 +105,7 @@ def get_database_url_from_env() -> str:
     Get database URL from environment variables.
 
     Environment variables:
-        DB_HOST: PostgreSQL host (default: localhost)
+        DB_HOST: PostgreSQL host (empty for Unix socket, 'localhost' for TCP/IP)
         DB_PORT: PostgreSQL port (default: 5432)
         DB_NAME: Database name (default: arxiv)
         DB_USER: Database user (default: postgres)
@@ -114,10 +114,24 @@ def get_database_url_from_env() -> str:
     Returns:
         Database URL string
     """
-    db_host = os.getenv('DB_HOST', 'localhost')
+    db_host = os.getenv('DB_HOST', '')
     db_port = os.getenv('DB_PORT', '5432')
     db_name = os.getenv('DB_NAME', 'arxiv')
     db_user = os.getenv('DB_USER', 'postgres')
     db_password = os.getenv('DB_PASSWORD', '')
 
-    return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+    # Build connection URL
+    # Empty host uses Unix socket (peer authentication)
+    # 'localhost' uses TCP/IP (requires password)
+    if db_host:
+        # TCP/IP connection
+        if db_password:
+            return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+        else:
+            return f"postgresql://{db_user}@{db_host}:{db_port}/{db_name}"
+    else:
+        # Unix socket connection
+        if db_password:
+            return f"postgresql://{db_user}:{db_password}@/{db_name}"
+        else:
+            return f"postgresql://{db_user}@/{db_name}"
