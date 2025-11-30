@@ -30,6 +30,7 @@ from database.models import ArxivPaper, ArxivCategory, ArxivPaperCategory
 class ArxivLoader:
     def __init__(
         self,
+        db_url: Optional[str] = None,
         db_host: str = "",
         db_port: int = 5432,
         db_name: str = "arxiv",
@@ -40,6 +41,7 @@ class ArxivLoader:
         """Initialize the ArXiv loader with database connection parameters."""
         self.pdf_base_path = pdf_base_path or os.getenv('PDF_BASE_PATH', './arxiv_pdfs')
         self.db_manager = DatabaseManager(
+            db_url=db_url,
             db_host=db_host,
             db_port=db_port,
             db_name=db_name,
@@ -47,7 +49,8 @@ class ArxivLoader:
             db_password=db_password
         )
         self.db_manager.create_engine_and_session()
-        print(f"✓ Connected to database: {db_name}")
+        engine_url = self.db_manager.engine.url.render_as_string(hide_password=True)
+        print(f"✓ Connected to database: {engine_url}")
 
     def close(self):
         """Close database connection."""
@@ -294,6 +297,11 @@ def main():
         description="Load arXiv metadata from JSONL into PostgreSQL using SQLAlchemy"
     )
     parser.add_argument(
+        '--db-url',
+        default=os.getenv('SQLALCHEMY_URL'),
+        help='Full SQLAlchemy DB URL (takes priority over other DB args)'
+    )
+    parser.add_argument(
         '--json-file',
         default=os.getenv('ARXIV_DATA_PATH', './arxiv-metadata-oai-snapshot.json'),
         help='Path to the JSONL file (default: from ARXIV_DATA_PATH env var)'
@@ -346,6 +354,7 @@ def main():
 
     # Create loader instance
     loader = ArxivLoader(
+        db_url=args.db_url,
         db_host=args.db_host,
         db_port=args.db_port,
         db_name=args.db_name,
