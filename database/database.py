@@ -5,8 +5,29 @@ Database connection and session management
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from contextlib import contextmanager
-from typing import Generator
+from typing import Generator, Optional
 import os
+
+
+def build_db_url(
+    db_host: str,
+    db_port: int,
+    db_name: str,
+    db_user: str,
+    db_password: str,
+) -> str:
+    """
+    Construct a PostgreSQL URL that supports Unix sockets (empty host) and TCP/IP.
+    """
+    if db_host:
+        # TCP/IP connection
+        auth_part = f"{db_user}:{db_password}@" if db_password else f"{db_user}@"
+        return f"postgresql://{auth_part}{db_host}:{db_port}/{db_name}"
+
+    # Unix socket connection (hostless); omit port to avoid ':/'
+    if db_password:
+        return f"postgresql://{db_user}:{db_password}@/{db_name}"
+    return f"postgresql://{db_user}@/{db_name}"
 
 
 class DatabaseManager:
@@ -14,6 +35,7 @@ class DatabaseManager:
 
     def __init__(
         self,
+        db_url: Optional[str] = None,
         db_host: str = "localhost",
         db_port: int = 5432,
         db_name: str = "arxiv",
@@ -30,7 +52,13 @@ class DatabaseManager:
             db_user: Database user
             db_password: Database password
         """
-        self.db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+        self.db_url = db_url or build_db_url(
+            db_host=db_host,
+            db_port=db_port,
+            db_name=db_name,
+            db_user=db_user,
+            db_password=db_password,
+        )
         self.engine = None
         self.SessionLocal = None
 
@@ -105,6 +133,7 @@ def get_database_url_from_env() -> str:
     Get database URL from environment variables.
 
     Environment variables:
+        SQLALCHEMY_URL: Full database URL (takes priority if set)
         DB_HOST: PostgreSQL host (empty for Unix socket, 'localhost' for TCP/IP)
         DB_PORT: PostgreSQL port (default: 5432)
         DB_NAME: Database name (default: arxiv)
@@ -114,24 +143,21 @@ def get_database_url_from_env() -> str:
     Returns:
         Database URL string
     """
+    # Highest priority: explicit SQLALCHEMY_URL
+    explicit_url = os.getenv('SQLALCHEMY_URL')
+    if explicit_url:
+        return explicit_url
+
     db_host = os.getenv('DB_HOST', '')
     db_port = os.getenv('DB_PORT', '5432')
     db_name = os.getenv('DB_NAME', 'arxiv')
     db_user = os.getenv('DB_USER', 'postgres')
     db_password = os.getenv('DB_PASSWORD', '')
 
-    # Build connection URL
-    # Empty host uses Unix socket (peer authentication)
-    # 'localhost' uses TCP/IP (requires password)
-    if db_host:
-        # TCP/IP connection
-        if db_password:
-            return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-        else:
-            return f"postgresql://{db_user}@{db_host}:{db_port}/{db_name}"
-    else:
-        # Unix socket connection
-        if db_password:
-            return f"postgresql://{db_user}:{db_password}@/{db_name}"
-        else:
-            return f"postgresql://{db_user}@/{db_name}"
+    return build_db_url(
+        db_host=db_host,
+        db_port=int(db_port),
+        db_name=db_name,
+        db_user=db_user,
+        db_password=db_password,
+    )
