@@ -149,6 +149,31 @@ alembic downgrade -1
 alembic revision --autogenerate -m "Description of changes"
 \`\`\`
 
+### Load Data into Database
+
+\`\`\`bash
+# Test with 1,000 records first
+python scripts/load_arxiv_data.py --max-records 1000
+
+# Load all records (1.7M+ papers) - uses settings from .env
+python scripts/load_arxiv_data.py
+
+# Custom file and batch size
+python scripts/load_arxiv_data.py --json-file /path/to/arxiv-metadata.json --batch-size 5000
+
+# Override database settings
+python scripts/load_arxiv_data.py --db-host localhost --db-user custom_user
+\`\`\`
+
+**Features**:
+- Batch processing (default: 1000 records/batch)
+- UPSERT operations (updates existing records, preserves PDF tracking status)
+- Progress tracking with records/sec rate
+- Automatic category extraction and linking
+- Error handling with retry logic
+
+**Output**: Real-time progress display showing processed records, insertion rate, and errors.
+
 ### Database Operations
 
 \`\`\`python
@@ -196,6 +221,9 @@ arxiv_database/
 │   ├── __init__.py          # Package exports
 │   ├── database.py          # Connection manager & session handling
 │   └── models.py            # SQLAlchemy ORM models
+├── scripts/                  # Data loading and management scripts
+│   ├── __init__.py          # Package initialization
+│   └── load_arxiv_data.py   # Load arXiv JSON data into database
 ├── outputs/                  # Generated analysis outputs
 ├── .env.example             # Environment configuration template
 ├── .gitignore               # Git ignore rules
@@ -327,7 +355,7 @@ Download the arXiv metadata snapshot from:
 - [x] SQLAlchemy ORM models
 - [x] Alembic migrations (initial schema + PDF tracking)
 - [x] PDF download tracking schema
-- [ ] Data loading scripts
+- [x] Data loading scripts (load arXiv JSON into database)
 - [ ] PDF download manager scripts
 - [ ] Testing suite
 - [ ] API endpoints (optional)
@@ -366,12 +394,30 @@ alembic downgrade base
 alembic upgrade head
 \`\`\`
 
+### Build DB With PDFs (Action List)
+- Set environment: copy `.env.example` to `.env`, then either set `SQLALCHEMY_URL` directly or configure `DB_HOST/DB_USER/...`. Empty `DB_HOST` uses a Unix socket; `DB_HOST=localhost` uses TCP (needs password).
+- Create storage: decide where PDFs live (e.g., `/mnt/d/arxiv_pdfs`) and set `PDF_BASE_PATH` to that path. Ensure the directory exists and is writable.
+- Place data: download `arxiv-metadata-oai-snapshot.json` and set `ARXIV_DATA_PATH` (or pass `--json-file`).
+- Migrate schema: run `alembic upgrade head` (picks up URL from env or `--db-url`).
+- Load metadata: `python scripts/load_arxiv_data.py --db-url "$SQLALCHEMY_URL" --pdf-path "$PDF_BASE_PATH" --json-file "$ARXIV_DATA_PATH" --batch-size 1000 --max-records 5000` (drop `--max-records` to load all). This fills `pdf_path` but leaves `pdf_downloaded` false.
+- Mark existing PDFs (optional): if PDFs already exist, update flags (e.g., script to check files and set `pdf_downloaded=true` for matching `pdf_path`).
+- Download PDFs: implement/run a downloader that respects `DOWNLOAD_DELAY` and updates `pdf_downloaded`, `pdf_download_attempted_at`, `pdf_download_error`.
+- Sync flags to disk state: run `python scripts/sync_pdf_status.py --db-url "$SQLALCHEMY_URL" --pdf-path "$PDF_BASE_PATH"` to align `pdf_downloaded` with what exists on disk.
+
+### Common Pitfalls
+- Socket vs TCP: empty `DB_HOST` builds a Unix-socket URL. If Postgres is not on `/var/run/postgresql` or peer auth fails, set `DB_HOST=localhost` (or host) and provide a password.
+- Missing data file: loader errors if `arxiv-metadata-oai-snapshot.json` is absent; set `ARXIV_DATA_PATH` or use `--json-file`.
+- Disk space: JSON is ~5GB; DB plus PDFs can be tens of GB. Ensure space for both DB storage and `PDF_BASE_PATH`.
+- Long loads: all 1.7M rows take time; start with `--max-records` to validate setup.
+- Flags not auto-set: loader does not mark existing PDFs as downloaded; run a post-step if needed.
+
 ## Notes
 
 - Always respect arXiv's rate limits when downloading PDFs
 - Large JSON file not included in repository (add to .gitignore)
 - PDF files stored separately, paths tracked in database
 - Use Alembic migrations instead of applying schema.sql directly
+- Use `scripts/sync_pdf_status.py` to align `pdf_downloaded` flags with files on disk
 
 ## License
 
