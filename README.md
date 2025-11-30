@@ -168,6 +168,18 @@ with db_manager.session_scope() as session:
     category = ArxivCategory(category='cs.AI', label='Artificial Intelligence')
     session.add(category)
     # Auto-commits on success, rolls back on exception
+
+# Query papers by PDF download status
+with db_manager.session_scope() as session:
+    # Get papers that haven't been downloaded yet
+    pending = session.query(ArxivPaper).filter(
+        ArxivPaper.pdf_downloaded == False
+    ).limit(100).all()
+
+    # Get papers with download errors
+    failed = session.query(ArxivPaper).filter(
+        ArxivPaper.pdf_download_error.isnot(None)
+    ).all()
 \`\`\`
 
 ## Project Structure
@@ -176,7 +188,8 @@ with db_manager.session_scope() as session:
 arxiv_database/
 ├── alembic/                  # Database migrations
 │   ├── versions/
-│   │   └── 001_initial_schema.py
+│   │   ├── 001_initial_schema.py
+│   │   └── 002_add_pdf_download_tracking.py
 │   ├── env.py               # Alembic environment config
 │   └── script.py.mako       # Migration template
 ├── database/                 # Database package
@@ -196,13 +209,34 @@ arxiv_database/
 
 ## Database Schema
 
+### Applied Migrations
+
+The database schema is managed through Alembic migrations:
+
+**Migration 001** - Initial schema (applied)
+- Created \`arxiv_papers\`, \`arxiv_categories\`, \`arxiv_paper_categories\` tables
+- Added full-text search (GIN) indexes on authors, title, abstract
+- Created auto-update trigger for \`updated_at\` timestamp
+
+**Migration 002** - PDF download tracking (applied)
+- Added \`pdf_downloaded\` boolean field (default: false)
+- Added \`pdf_download_attempted_at\` timestamp field
+- Added \`pdf_download_error\` text field for error messages
+- Created index on \`pdf_downloaded\` for efficient queries
+
+**Current version**: 002 (head)
+
 ### Tables
 
-**\`arxiv_papers\`**: Main table storing paper metadata
+**\`arxiv_papers\`**: Main table storing paper metadata (20 columns)
 - **Primary key**: \`id\` (arXiv paper ID, e.g., "0704.0001")
-- **Indexes**: Full-text search (GIN) on authors, title, abstract
-- **Fields**: submitter, authors, title, abstract, DOI, categories, versions (JSONB)
-- **PDF tracking**: \`pdf_path\`, \`pdf_downloaded\`, \`pdf_download_attempted_at\`, \`pdf_download_error\`
+- **Indexes**: Full-text search (GIN) on authors, title, abstract; B-tree on update_date, pdf_downloaded
+- **Core fields**: submitter, authors, title, abstract, DOI, categories, versions (JSONB)
+- **PDF tracking**:
+  - \`pdf_path\` - Full path to PDF file (based on PDF_BASE_PATH)
+  - \`pdf_downloaded\` - Boolean flag indicating successful download (indexed)
+  - \`pdf_download_attempted_at\` - Timestamp of last download attempt
+  - \`pdf_download_error\` - Error message if download failed
 - **Timestamps**: \`created_at\`, \`updated_at\` (auto-updated via trigger)
 
 **\`arxiv_categories\`**: Category vocabulary
@@ -220,6 +254,8 @@ arxiv_database/
 - JSONB columns for flexible nested data (versions, parsed authors)
 - Foreign key constraints with cascading deletes
 - Connection pooling (10 connections, 20 overflow)
+- PDF download tracking with status, timestamps, and error logging
+- Indexed queries for downloaded/pending PDFs
 
 ## Database Package
 
@@ -289,9 +325,10 @@ Download the arXiv metadata snapshot from:
 - [x] Database connection manager
 - [x] Git repository with proper .gitignore
 - [x] SQLAlchemy ORM models
-- [x] Alembic migrations
+- [x] Alembic migrations (initial schema + PDF tracking)
+- [x] PDF download tracking schema
 - [ ] Data loading scripts
-- [ ] PDF download manager
+- [ ] PDF download manager scripts
 - [ ] Testing suite
 - [ ] API endpoints (optional)
 - [ ] Documentation
