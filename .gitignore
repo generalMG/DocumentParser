@@ -1,2 +1,41 @@
+# Environment files (contain sensitive credentials)
+.env
+.env.local
+*.env
+
+# Output directories
 *outputs*/*
+
+# System files
 *DS_Store*
+.DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data files (large datasets)
+*.json
+!.gitkeep
+
+# Downloaded PDFs
+arxiv_pdfs/
+*.pdf
+
+# Database
+# *.db
+# *.sqlite

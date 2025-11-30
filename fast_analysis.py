@@ -175,4 +175,5 @@ if __name__ == '__main__':
     multi_version = sum(c for v, c in sorted_versions if v > 1)
     print(f"Multi-version articles (filtered): {multi_version:,} ({(multi_version/total_articles)*100:.2f}%)")
 
+    # uncomment this section to show the plot
     #plt.show()
