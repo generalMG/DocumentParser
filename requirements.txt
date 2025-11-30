@@ -8,3 +8,7 @@ alembic
 
 # Configuration
 python-dotenv
+
+# Optional OCR (PaddleOCR-VL)
+paddlepaddle-gpu  # or paddlepaddle for CPU-only
+paddleocr
