@@ -7,9 +7,14 @@ from sqlalchemy import engine_from_config, pool
 from alembic import context
 import os
 import sys
+from dotenv import load_dotenv
 
 # Add project directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+project_dir = os.path.dirname(os.path.dirname(__file__))
+sys.path.insert(0, project_dir)
+
+# Load .env file (override=True to override existing environment variables)
+load_dotenv(os.path.join(project_dir, '.env'), override=True)
 
 # Import models
 from database.models import Base
