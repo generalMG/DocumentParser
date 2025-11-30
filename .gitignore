@@ -39,3 +39,9 @@ arxiv_pdfs/
 # Database
 # *.db
 # *.sqlite
+
+# Miscellaneous
+debug_paddle.py
+test_safetensors.py
+test_safetensors_dtype.py
+test_torch_conversion.py
