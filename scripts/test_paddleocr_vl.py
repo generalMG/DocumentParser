@@ -13,8 +13,10 @@ import argparse
 import json
 import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional, Any
+from typing import Any, Dict, List, Tuple
+import multiprocessing as mp
 from dotenv import load_dotenv
 
 # Add project root to import path
@@ -103,53 +105,112 @@ except ImportError:
 
 
 
-def run_ocr(pdf_path: Path, pages: int, device: str, model_dir: Path, output: Path):
-    print(f"Running PaddleOCR-VL on: {pdf_path}")
-    print(f"Pages: {pages} | Device: {device}")
-    print(f"Model dir: {model_dir}")
+def _to_serializable(obj: Any):
+    try:
+        import numpy as np  # type: ignore
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.generic):
+            return obj.item()
+    except Exception:
+        pass
+    if isinstance(obj, (list, tuple)):
+        return [_to_serializable(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _to_serializable(v) for k, v in obj.items()}
+    try:
+        return str(obj)
+    except Exception:
+        return "<unserializable>"
+
+
+def _process_pages(
+    pdf_path: str,
+    device: str,
+    model_dir: str,
+    page_indices: List[int],
+) -> List[Tuple[int, Any]]:
+    """Worker to process a subset of pages."""
+    import paddle
+    from paddleocr import PaddleOCRVL  # type: ignore
 
     try:
         paddle.device.set_device(device)
-    except Exception as e:
-        print(f"Warning: could not set device '{device}', falling back to default: {e}")
+    except Exception:
+        pass
 
-    try:
-        ocr = PaddleOCRVL(
-            use_layout_detection=True,
-            use_doc_orientation_classify=True,
-            use_doc_unwarping=False,
-            layout_detection_model_dir=str(model_dir / "PP-DocLayoutV2"),
-            vl_rec_model_dir=str(model_dir),
-        )
-    except Exception as e:
-        raise SystemExit(
-            f"Failed to initialize PaddleOCR-VL (likely missing model files or device not available): {e}"
-        )
+    ocr = PaddleOCRVL(
+        use_layout_detection=True,
+        use_doc_orientation_classify=True,
+        use_doc_unwarping=False,
+        layout_detection_model_dir=os.path.join(model_dir, "PP-DocLayoutV2"),
+        vl_rec_model_dir=model_dir,
+    )
 
-    results = ocr.predict(str(pdf_path))
-    if isinstance(results, list) and pages > 0:
-        results = results[:pages]
+    results = ocr.predict(pdf_path)
+    # select requested pages if available
+    out: List[Tuple[int, Any]] = []
+    for idx in page_indices:
+        if isinstance(results, list) and idx < len(results):
+            out.append((idx, results[idx]))
+    return out
 
-    def to_serializable(obj: Any):
+
+def run_ocr(pdf_path: Path, pages: int, device: str, model_dir: Path, output: Path, processes: int):
+    print(f"Running PaddleOCR-VL on: {pdf_path}")
+    print(f"Pages: {pages} | Device: {device}")
+    print(f"Model dir: {model_dir}")
+    print(f"Processes: {processes}")
+
+    if pages < 1:
+        raise SystemExit("pages must be >= 1")
+
+    if processes <= 1:
         try:
-            import numpy as np  # type: ignore
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            if isinstance(obj, np.generic):
-                return obj.item()
-        except Exception:
-            pass
-        if isinstance(obj, (list, tuple)):
-            return [to_serializable(x) for x in obj]
-        if isinstance(obj, dict):
-            return {k: to_serializable(v) for k, v in obj.items()}
-        # Fallback: stringify non-JSON-serializable objects (e.g., Font, Paddle classes)
-        try:
-            return str(obj)
-        except Exception:
-            return "<unserializable>"
+            paddle.device.set_device(device)
+        except Exception as e:
+            print(f"Warning: could not set device '{device}', falling back to default: {e}")
 
-    results = to_serializable(results)
+        try:
+            ocr = PaddleOCRVL(
+                use_layout_detection=True,
+                use_doc_orientation_classify=True,
+                use_doc_unwarping=False,
+                layout_detection_model_dir=str(model_dir / "PP-DocLayoutV2"),
+                vl_rec_model_dir=str(model_dir),
+            )
+        except Exception as e:
+            raise SystemExit(
+                f"Failed to initialize PaddleOCR-VL (likely missing model files or device not available): {e}"
+            )
+
+        results = ocr.predict(str(pdf_path))
+        if isinstance(results, list) and pages > 0:
+            results = results[:pages]
+    else:
+        page_indices = list(range(pages))
+        # split indices across workers
+        chunks = [page_indices[i::processes] for i in range(processes)]
+        collected: Dict[int, Any] = {}
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=processes, mp_context=ctx) as ex:
+            futures = [
+                ex.submit(
+                    _process_pages,
+                    str(pdf_path),
+                    device,
+                    str(model_dir),
+                    chunk,
+                )
+                for chunk in chunks
+                if chunk
+            ]
+            for fut in as_completed(futures):
+                for idx, res in fut.result():
+                    collected[idx] = res
+        results = [collected[i] for i in sorted(collected.keys()) if i < pages]
+
+    results = _to_serializable(results)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with open(output, "w", encoding="utf-8") as f:
@@ -178,6 +239,12 @@ def parse_args():
         help="Device to use (e.g., gpu:0 or cpu)",
     )
     parser.add_argument(
+        "--processes",
+        type=int,
+        default=1,
+        help="Number of parallel processes (each loads its own model)",
+    )
+    parser.add_argument(
         "--model-dir",
         default=os.path.expanduser("~/.paddlex/official_models"),
         help="Directory containing PaddleOCR-VL model files",
@@ -199,7 +266,14 @@ def main():
     output = Path(args.output) if args.output else Path("outputs") / f"ocr_{pdf_path.stem}.json"
     model_dir = Path(args.model_dir)
 
-    run_ocr(pdf_path=pdf_path, pages=args.pages, device=args.device, model_dir=model_dir, output=output)
+    run_ocr(
+        pdf_path=pdf_path,
+        pages=args.pages,
+        device=args.device,
+        model_dir=model_dir,
+        output=output,
+        processes=args.processes,
+    )
 
 
 if __name__ == "__main__":
