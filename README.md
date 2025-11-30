@@ -207,6 +207,12 @@ with db_manager.session_scope() as session:
     ).all()
 \`\`\`
 
+### OCR (Experimental)
+
+- Install optional deps: `pip install paddlepaddle-gpu paddleocr` (or `paddlepaddle` for CPU-only).
+- Run test script on a PDF: `python scripts/test_paddleocr_vl.py /path/to/file.pdf --pages 1 --cpu` (omit `--cpu` to use GPU).
+- Models download from PaddleOCR hosts; ensure network access or pre-download to the default cache.
+
 ## Project Structure
 
 \`\`\`
