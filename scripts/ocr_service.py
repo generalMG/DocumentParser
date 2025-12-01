@@ -82,8 +82,14 @@ async def _startup():
     global POOL
     if SERVICE_ARGS is None:
         return
-    ctx = mp.get_context("spawn")
-    POOL = ProcessPoolExecutor(max_workers=SERVICE_ARGS.workers, mp_context=ctx)
+    # fall back to threads if process pool creation fails (e.g., permission errors)
+    try:
+        ctx = mp.get_context("spawn")
+        POOL = ProcessPoolExecutor(max_workers=SERVICE_ARGS.workers, mp_context=ctx)
+    except Exception as e:
+        print(f"Process pool unavailable ({e}), falling back to ThreadPoolExecutor")
+        from concurrent.futures import ThreadPoolExecutor
+        POOL = ThreadPoolExecutor(max_workers=SERVICE_ARGS.workers)
 
 
 @app.on_event("shutdown")
@@ -139,7 +145,7 @@ def parse_args():
 def main():
     global SERVICE_ARGS
     SERVICE_ARGS = parse_args()
-    uvicorn.run("scripts.ocr_service:app", host=SERVICE_ARGS.host, port=SERVICE_ARGS.port, log_level="info")
+    uvicorn.run(app, host=SERVICE_ARGS.host, port=SERVICE_ARGS.port, log_level="info")
 
 
 if __name__ == "__main__":
