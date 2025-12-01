@@ -92,8 +92,9 @@ class PDFDownloader:
 
     def fetch_candidates(
         self, session, limit: int, categories: Optional[List[str]]
-    ) -> list[ArxivPaper]:
-        q = session.query(ArxivPaper).filter(
+    ) -> list[str]:
+        """Return a list of paper IDs to download."""
+        q = session.query(ArxivPaper.id).filter(
             ArxivPaper.pdf_downloaded.is_(False)
         )
         if categories:
@@ -104,7 +105,7 @@ class PDFDownloader:
             if ors:
                 from sqlalchemy import or_
                 q = q.filter(or_(*ors))
-        return q.order_by(ArxivPaper.id).limit(limit).all()
+        return [row[0] for row in q.order_by(ArxivPaper.id).limit(limit).all()]
 
     def run(self, limit: int, auto_commit: bool):
         total = 0
@@ -115,13 +116,13 @@ class PDFDownloader:
             candidates = self.fetch_candidates(session, limit=limit, categories=self.categories)
 
         print(f"Found {len(candidates)} candidates to download")
-        for idx, paper in enumerate(candidates, 1):
-            dest = self.pdf_base_path / f"{paper.id}.pdf"
+        for idx, paper_id in enumerate(candidates, 1):
+            dest = self.pdf_base_path / f"{paper_id}.pdf"
             started_at = datetime.utcnow()
-            err = self.download_pdf(paper.id, dest)
+            err = self.download_pdf(paper_id, dest)
 
             with self.db_manager.session_scope() as session:
-                db_paper = session.query(ArxivPaper).get(paper.id)
+                db_paper = session.get(ArxivPaper, paper_id)
                 if db_paper:
                     db_paper.pdf_download_attempted_at = started_at
                     if err is None:
@@ -135,7 +136,7 @@ class PDFDownloader:
                 total += 1
 
             print(
-                f"[{idx}/{len(candidates)}] {paper.id} -> "
+                f"[{idx}/{len(candidates)}] {paper_id} -> "
                 f"{'ok' if err is None else 'fail: ' + err}"
             )
 
