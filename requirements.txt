@@ -9,6 +9,10 @@ alembic
 # Configuration
 python-dotenv
 
+# HTTP service and OCR
+fastapi
+uvicorn
+requests
 # Optional OCR (PaddleOCR-VL)
 paddlepaddle-gpu  # or paddlepaddle for CPU-only
 paddleocr
