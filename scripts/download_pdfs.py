@@ -91,12 +91,14 @@ class PDFDownloader:
         return last_error
 
     def fetch_candidates(
-        self, session, limit: int, categories: Optional[List[str]]
+        self, session, limit: int, categories: Optional[List[str]], include_errors: bool
     ) -> list[str]:
         """Return a list of paper IDs to download."""
         q = session.query(ArxivPaper.id).filter(
             ArxivPaper.pdf_downloaded.is_(False)
         )
+        if not include_errors:
+            q = q.filter(ArxivPaper.pdf_download_error.is_(None))
         if categories:
             pattern = "%{}%"
             ors = []
@@ -107,13 +109,15 @@ class PDFDownloader:
                 q = q.filter(or_(*ors))
         return [row[0] for row in q.order_by(ArxivPaper.id).limit(limit).all()]
 
-    def run(self, limit: int, auto_commit: bool):
+    def run(self, limit: int, auto_commit: bool, include_errors: bool):
         total = 0
         success = 0
         failures = 0
 
         with self.db_manager.session_scope() as session:
-            candidates = self.fetch_candidates(session, limit=limit, categories=self.categories)
+            candidates = self.fetch_candidates(
+                session, limit=limit, categories=self.categories, include_errors=include_errors
+            )
 
         print(f"Found {len(candidates)} candidates to download")
         for idx, paper_id in enumerate(candidates, 1):
@@ -223,6 +227,11 @@ def parse_args():
         action="store_true",
         help="Enable auto mode (sleep between downloads)",
     )
+    parser.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="Include papers that previously failed (pdf_download_error is not NULL)",
+    )
     return parser.parse_args()
 
 
@@ -241,7 +250,7 @@ def main():
         timeout=args.timeout,
     )
     downloader.categories = args.categories
-    downloader.run(limit=args.limit, auto_commit=args.auto)
+    downloader.run(limit=args.limit, auto_commit=args.auto, include_errors=args.retry_errors)
 
 
 if __name__ == "__main__":
