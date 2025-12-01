@@ -36,7 +36,7 @@ class DatabaseManager:
     def __init__(
         self,
         db_url: Optional[str] = None,
-        db_host: str = "localhost",
+        db_host: str = "",
         db_port: int = 5432,
         db_name: str = "arxiv",
         db_user: str = "postgres",
@@ -46,7 +46,7 @@ class DatabaseManager:
         Initialize database manager.
 
         Args:
-            db_host: PostgreSQL host
+            db_host: PostgreSQL host (empty string uses Unix socket)
             db_port: PostgreSQL port
             db_name: Database name
             db_user: Database user

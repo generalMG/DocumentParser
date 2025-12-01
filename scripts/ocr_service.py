@@ -47,10 +47,13 @@ def _to_serializable(obj: Any):
         return "<unserializable>"
 
 
-def _process_pdf(pdf_bytes: bytes, pages: int, device: str, model_dir: str) -> List[Any]:
-    """Worker: load model once per process and run predict."""
-    import paddle
-    from paddleocr import PaddleOCRVL  # type: ignore
+def _process_pdf(pdf_bytes: bytes, pages: int, device: str, model_dir: str) -> dict:
+    """Worker: load model once per process and run predict. Returns dict to avoid pickling errors."""
+    try:
+        import paddle
+        from paddleocr import PaddleOCRVL  # type: ignore
+    except Exception as e:
+        return {"ok": False, "error": f"Import failed: {e}"}
 
     global _MODEL
     try:
@@ -58,23 +61,26 @@ def _process_pdf(pdf_bytes: bytes, pages: int, device: str, model_dir: str) -> L
     except Exception:
         pass
 
-    if "_MODEL" not in globals() or _MODEL is None:
-        _MODEL = PaddleOCRVL(
-            use_layout_detection=True,
-            use_doc_orientation_classify=True,
-            use_doc_unwarping=False,
-            layout_detection_model_dir=os.path.join(model_dir, "PP-DocLayoutV2"),
-            vl_rec_model_dir=model_dir,
-        )
+    try:
+        if "_MODEL" not in globals() or _MODEL is None:
+            _MODEL = PaddleOCRVL(
+                use_layout_detection=True,
+                use_doc_orientation_classify=True,
+                use_doc_unwarping=False,
+                layout_detection_model_dir=os.path.join(model_dir, "PP-DocLayoutV2"),
+                vl_rec_model_dir=model_dir,
+            )
 
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
-        tmp.write(pdf_bytes)
-        tmp.flush()
-        results = _MODEL.predict(tmp.name)
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
+            tmp.write(pdf_bytes)
+            tmp.flush()
+            results = _MODEL.predict(tmp.name)
 
-    if isinstance(results, list) and pages and pages > 0:
-        results = results[:pages]
-    return _to_serializable(results)
+        if isinstance(results, list) and pages and pages > 0:
+            results = results[:pages]
+        return {"ok": True, "results": _to_serializable(results)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.on_event("startup")
@@ -125,7 +131,10 @@ async def ocr_endpoint(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
 
-    return JSONResponse({"results": result})
+    if not result.get("ok"):
+        raise HTTPException(status_code=500, detail=f"OCR failed: {result.get('error')}")
+
+    return JSONResponse({"results": result.get("results")})
 
 
 def parse_args():
