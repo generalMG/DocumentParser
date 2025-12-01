@@ -72,7 +72,7 @@ def _process_pdf(pdf_bytes: bytes, pages: int, device: str, model_dir: str) -> L
         tmp.flush()
         results = _MODEL.predict(tmp.name)
 
-    if isinstance(results, list) and pages > 0:
+    if isinstance(results, list) and pages and pages > 0:
         results = results[:pages]
     return _to_serializable(results)
 
@@ -108,7 +108,7 @@ async def health():
 @app.post("/ocr")
 async def ocr_endpoint(
     file: UploadFile = File(...),
-    pages: int = Form(0),
+    pages: int = Form(None),
 ):
     if POOL is None:
         raise HTTPException(status_code=503, detail="Worker pool not ready")

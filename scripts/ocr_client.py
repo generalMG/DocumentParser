@@ -10,14 +10,16 @@ Client script to fetch PDFs from the database and send them to the OCR service.
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import List, Tuple
 
 import requests
 from dotenv import load_dotenv
 
-from database.database import DatabaseManager
-from database.models import ArxivPaper
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from database.database import DatabaseManager  # noqa: E402
+from database.models import ArxivPaper  # noqa: E402
 
 load_dotenv(override=True)
 
@@ -40,7 +42,7 @@ def main():
     parser = argparse.ArgumentParser(description="Send downloaded PDFs to OCR service")
     parser.add_argument("--service-url", default="http://localhost:8000/ocr", help="OCR service endpoint")
     parser.add_argument("--output-dir", default="outputs/ocr_results", help="Directory to save JSON outputs")
-    parser.add_argument("--pages", type=int, default=1, help="Number of pages to process")
+    parser.add_argument("--pages", type=int, default=None, help="Number of pages to process (default: all)")
     parser.add_argument("--limit", type=int, default=10, help="Max number of PDFs to send")
     parser.add_argument("--offset", type=int, default=0, help="Offset for DB query")
     parser.add_argument("--db-url", default=os.getenv("SQLALCHEMY_URL"), help="Optional DB URL override")
