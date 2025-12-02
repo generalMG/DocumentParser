@@ -79,7 +79,7 @@ def main():
             files = {"file": (pdf_file.name, f, "application/pdf")}
             data = {"pages": args.pages}
             try:
-                resp = requests.post(args.service_url, files=files, data=data, timeout=300)
+                resp = requests.post(args.service_url, files=files, data=data, timeout=6000)
             except Exception as e:
                 print(f"{paper_id}: request failed: {e}")
                 continue
