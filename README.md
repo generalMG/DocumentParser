@@ -179,7 +179,7 @@ python scripts/load_arxiv_data.py --db-host localhost --db-user custom_user
 \`\`\`python
 from database import DatabaseManager, ArxivPaper, ArxivCategory
 
-# Create database manager
+# Create database manager (defaults to Unix socket when DB_HOST is empty)
 db_manager = DatabaseManager()
 
 # Use session context manager
@@ -407,7 +407,7 @@ alembic upgrade head
 - Migrate schema: run `alembic upgrade head` (picks up URL from env or `--db-url`).
 - Load metadata: `python scripts/load_arxiv_data.py --db-url "$SQLALCHEMY_URL" --pdf-path "$PDF_BASE_PATH" --json-file "$ARXIV_DATA_PATH" --batch-size 1000 --max-records 5000` (drop `--max-records` to load all). This fills `pdf_path` but leaves `pdf_downloaded` false.
 - Mark existing PDFs (optional): if PDFs already exist, update flags (e.g., script to check files and set `pdf_downloaded=true` for matching `pdf_path`).
-- Download PDFs: implement/run a downloader that respects `DOWNLOAD_DELAY` and updates `pdf_downloaded`, `pdf_download_attempted_at`, `pdf_download_error`.
+- Download PDFs: `python scripts/download_pdfs.py --limit 2000 --auto` (respects `DOWNLOAD_DELAY`, updates `pdf_downloaded`, `pdf_download_attempted_at`, `pdf_download_error`). By default it skips rows with a prior `pdf_download_error`; add `--retry-errors` to reattempt failed ones.
 - Sync flags to disk state: run `python scripts/sync_pdf_status.py --db-url "$SQLALCHEMY_URL" --pdf-path "$PDF_BASE_PATH"` to align `pdf_downloaded` with what exists on disk.
 
 ### Common Pitfalls
