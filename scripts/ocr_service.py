@@ -22,6 +22,79 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+try:
+    from safetensors import safe_open as original_safe_open
+    import torch
+    import numpy as np
+    import paddle
+
+    def torch_to_paddle(pt_tensor):
+        # Convert torch tensor to paddle tensor
+        # Handle bfloat16 specifically because numpy doesn't support it
+        if pt_tensor.dtype == torch.bfloat16:
+            np_array = pt_tensor.float().numpy()
+            pd_tensor = paddle.to_tensor(np_array)
+            return pd_tensor.cast("bfloat16")
+        else:
+            np_array = pt_tensor.numpy()
+            return paddle.to_tensor(np_array)
+
+    class SafeSliceWrapper:
+        def __init__(self, slice_obj):
+            self.slice_obj = slice_obj
+
+        def __getitem__(self, item):
+            # Get torch tensor slice and convert to paddle tensor
+            pt_tensor = self.slice_obj[item]
+            return torch_to_paddle(pt_tensor)
+
+        def get_shape(self):
+            return self.slice_obj.get_shape()
+
+    class SafeOpenWrapper:
+        def __init__(self, path, framework, device):
+            self.path = path
+            self.framework = framework
+            self.device = device
+            self.f = None
+
+        def __enter__(self):
+            # Force framework="pt" to handle bfloat16
+            self.f = original_safe_open(self.path, framework="pt", device=self.device)
+            self.inner = self.f.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return self.f.__exit__(exc_type, exc_value, traceback)
+
+        def get_tensor(self, key):
+            # Get torch tensor and convert to paddle tensor
+            pt_tensor = self.inner.get_tensor(key)
+            return torch_to_paddle(pt_tensor)
+
+        def get_slice(self, key):
+            return SafeSliceWrapper(self.inner.get_slice(key))
+
+        def keys(self):
+            return self.inner.keys()
+        
+        def metadata(self):
+            return self.inner.metadata()
+
+    def monkeypatch_safe_open(path, framework="pt", device="cpu"):
+        if framework == "paddle":
+            # Use PyTorch as backend to read tensors (supports bfloat16)
+            return SafeOpenWrapper(path, framework="pt", device=device)
+        return original_safe_open(path, framework=framework, device=device)
+
+    import safetensors
+    safetensors.safe_open = monkeypatch_safe_open
+    print("Monkeypatched safetensors.safe_open to support 'paddle' framework via torch.")
+
+except ImportError:
+    pass  # safetensors or torch might not be installed
+
+
 app = FastAPI(title="PaddleOCR-VL Service")
 
 POOL: Optional[ProcessPoolExecutor] = None
