@@ -304,6 +304,58 @@ def _init_model_worker(device: str, model_dir: str) -> dict:
     return {"ok": True, "device": device}
 
 
+def _parse_parsing_res(parsing_res_item: str) -> dict:
+    """Parse a single item from parsing_res_list to extract label, bbox, and content."""
+    try:
+        lines = parsing_res_item.strip().split('\n')
+        parsed = {}
+        for line in lines:
+            line = line.strip()
+            if line.startswith('label:'):
+                parsed['label'] = line.replace('label:', '').strip()
+            elif line.startswith('bbox:'):
+                bbox_str = line.replace('bbox:', '').strip()
+                # Parse [x1, y1, x2, y2]
+                bbox_str = bbox_str.strip('[]')
+                parsed['bbox'] = [float(x.strip()) for x in bbox_str.split(',')]
+            elif line.startswith('content:'):
+                parsed['content'] = line.replace('content:', '').strip()
+        return parsed
+    except Exception as e:
+        logger.warning(f"Failed to parse parsing_res item: {e}")
+        return {}
+
+
+def _enrich_results(results: Any) -> Any:
+    """Enrich layout_det_res boxes with content from parsing_res_list."""
+    if not isinstance(results, list):
+        return results
+
+    enriched = []
+    for page_result in results:
+        if not isinstance(page_result, dict):
+            enriched.append(page_result)
+            continue
+
+        # Parse parsing_res_list
+        parsing_list = page_result.get('parsing_res_list', [])
+        parsed_items = [_parse_parsing_res(item) for item in parsing_list]
+
+        # Enrich layout_det_res boxes
+        layout_det_res = page_result.get('layout_det_res', {})
+        boxes = layout_det_res.get('boxes', [])
+
+        # Match by index (they should correspond 1:1)
+        for i, box in enumerate(boxes):
+            if i < len(parsed_items) and parsed_items[i]:
+                # Add content to box
+                box['content'] = parsed_items[i].get('content', '')
+
+        enriched.append(page_result)
+
+    return enriched
+
+
 def _process_pdf(pdf_bytes: bytes, pages: int, device: str, model_dir: str) -> dict:
     """Worker: run predict on PDF. Model must be pre-loaded. Returns dict to avoid pickling errors."""
     global _MODEL
@@ -322,6 +374,10 @@ def _process_pdf(pdf_bytes: bytes, pages: int, device: str, model_dir: str) -> d
 
         if isinstance(results, list) and pages and pages > 0:
             results = results[:pages]
+
+        # Enrich results with content in layout boxes
+        results = _enrich_results(results)
+
         return {"ok": True, "results": _to_serializable(results)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -364,6 +420,9 @@ def _process_pdf_page(pdf_bytes: bytes, page_num: int, device: str, model_dir: s
             tmp.write(single_page_bytes)
             tmp.flush()
             results = _MODEL.predict(tmp.name)
+
+        # Enrich results with content in layout boxes
+        results = _enrich_results(results)
 
         # Results should be a list with one element (the single page)
         if isinstance(results, list) and len(results) > 0:

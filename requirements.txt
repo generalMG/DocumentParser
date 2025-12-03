@@ -15,7 +15,7 @@ uvicorn
 requests
 PyPDF2  # PDF page extraction
 reportlab  # PDF generation for warm-up
-pynvml  # GPU monitoring
+nvidia-ml-py  # GPU monitoring (replaces deprecated pynvml)
 # Optional OCR (PaddleOCR-VL)
 paddlepaddle-gpu  # or paddlepaddle for CPU-only
 paddleocr
