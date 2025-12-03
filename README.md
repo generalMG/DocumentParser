@@ -207,11 +207,50 @@ with db_manager.session_scope() as session:
     ).all()
 \`\`\`
 
-### OCR (Experimental)
+### OCR Pipeline
 
-- Install optional deps: `pip install paddlepaddle-gpu paddleocr` (or `paddlepaddle` for CPU-only).
-- Run test script on a PDF: `python scripts/test_paddleocr_vl.py /path/to/file.pdf --pages 1 --cpu` (omit `--cpu` to use GPU).
-- Models download from PaddleOCR hosts; ensure network access or pre-download to the default cache.
+The project includes a PaddleOCR-VL based pipeline for extracting text and layout from PDFs.
+
+#### Prerequisites
+- **GPU Support**: Recommended for reasonable performance.
+- **Dependencies**:
+  ```bash
+  pip install paddlepaddle-gpu paddleocr fastapi uvicorn python-multipart requests torch safetensors
+  ```
+  *(Note: `torch` and `safetensors` are required for a compatibility fix with PaddleOCR models)*
+
+#### 1. Start the OCR Service
+The service hosts the PaddleOCR-VL model and exposes a REST API.
+
+```bash
+# Start service on port 8000 (default)
+python scripts/ocr_service.py --port 8000 --device gpu:0
+
+# For CPU only
+python scripts/ocr_service.py --device cpu
+```
+*The service will automatically download models to `~/.paddlex/official_models` on first run.*
+
+#### 2. Run the OCR Client
+The client fetches PDFs from the database (where `pdf_downloaded=true`) and sends them to the service.
+
+```bash
+# Process 10 PDFs
+python scripts/ocr_client.py --limit 10
+
+# Process specific number of pages per PDF
+python scripts/ocr_client.py --limit 10 --pages 5
+
+# Specify output directory
+python scripts/ocr_client.py --output-dir outputs/ocr_json
+```
+
+#### 3. Test Script (Single File)
+To test OCR on a single local PDF file without the database:
+
+```bash
+python scripts/test_paddleocr_vl.py /path/to/paper.pdf --pages 1
+```
 
 ## Project Structure
 

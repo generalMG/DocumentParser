@@ -13,6 +13,9 @@ python-dotenv
 fastapi
 uvicorn
 requests
+PyPDF2  # PDF page extraction
+reportlab  # PDF generation for warm-up
+pynvml  # GPU monitoring
 # Optional OCR (PaddleOCR-VL)
 paddlepaddle-gpu  # or paddlepaddle for CPU-only
 paddleocr
