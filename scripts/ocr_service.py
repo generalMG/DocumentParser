@@ -304,23 +304,41 @@ def _init_model_worker(device: str, model_dir: str) -> dict:
     return {"ok": True, "device": device}
 
 
-def _parse_parsing_res(parsing_res_item: str) -> dict:
+def _parse_parsing_res(parsing_res_item) -> dict:
     """Parse a single item from parsing_res_list to extract label, bbox, and content."""
     try:
-        lines = parsing_res_item.strip().split('\n')
-        parsed = {}
-        for line in lines:
-            line = line.strip()
-            if line.startswith('label:'):
-                parsed['label'] = line.replace('label:', '').strip()
-            elif line.startswith('bbox:'):
-                bbox_str = line.replace('bbox:', '').strip()
-                # Parse [x1, y1, x2, y2]
-                bbox_str = bbox_str.strip('[]')
-                parsed['bbox'] = [float(x.strip()) for x in bbox_str.split(',')]
-            elif line.startswith('content:'):
-                parsed['content'] = line.replace('content:', '').strip()
-        return parsed
+        # Check if it's a PaddleOCRVLBlock object (has attributes)
+        if hasattr(parsing_res_item, 'label') and hasattr(parsing_res_item, 'bbox'):
+            # Extract directly from object attributes
+            parsed = {}
+            if hasattr(parsing_res_item, 'label'):
+                parsed['label'] = str(parsing_res_item.label)
+            if hasattr(parsing_res_item, 'bbox'):
+                parsed['bbox'] = parsing_res_item.bbox
+            if hasattr(parsing_res_item, 'content'):
+                parsed['content'] = str(parsing_res_item.content)
+            elif hasattr(parsing_res_item, 'text'):
+                parsed['content'] = str(parsing_res_item.text)
+            return parsed
+
+        # Otherwise, try to parse as string (for backwards compatibility)
+        if isinstance(parsing_res_item, str):
+            lines = parsing_res_item.strip().split('\n')
+            parsed = {}
+            for line in lines:
+                line = line.strip()
+                if line.startswith('label:'):
+                    parsed['label'] = line.replace('label:', '').strip()
+                elif line.startswith('bbox:'):
+                    bbox_str = line.replace('bbox:', '').strip()
+                    # Parse [x1, y1, x2, y2]
+                    bbox_str = bbox_str.strip('[]')
+                    parsed['bbox'] = [float(x.strip()) for x in bbox_str.split(',')]
+                elif line.startswith('content:'):
+                    parsed['content'] = line.replace('content:', '').strip()
+            return parsed
+
+        return {}
     except Exception as e:
         logger.warning(f"Failed to parse parsing_res item: {e}")
         return {}
