@@ -385,18 +385,45 @@ def _process_pdf(pdf_bytes: bytes, pages: int, device: str, model_dir: str) -> d
             return init_result
 
     try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
-            tmp.write(pdf_bytes)
-            tmp.flush()
-            results = _MODEL.predict(tmp.name)
-
-        if isinstance(results, list) and pages and pages > 0:
-            results = results[:pages]
+        from pdf2image import convert_from_bytes
+        
+        # Convert PDF to images at fixed DPI
+        # This ensures consistent coordinates regardless of PDF dimensions
+        target_dpi = 200
+        images = convert_from_bytes(pdf_bytes, dpi=target_dpi)
+        
+        if pages and pages > 0:
+            images = images[:pages]
+            
+        results = []
+        for i, img in enumerate(images):
+            # Save to temp file for PaddleOCR (it expects file path or numpy array)
+            # Using file path is safer for memory with large images
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp_img:
+                img.save(tmp_img.name)
+                page_result = _MODEL.predict(tmp_img.name)
+                
+                # If result is a list (multi-page), take the first item since we process one by one
+                if isinstance(page_result, list) and len(page_result) > 0:
+                    page_result = page_result[0]
+                    
+                # Add page index
+                if isinstance(page_result, dict):
+                    page_result['page_index'] = str(i)
+                    
+                results.append(page_result)
 
         # Enrich results with content in layout boxes
         results = _enrich_results(results)
+        
+        # Inject DPI info into results
+        serializable_results = _to_serializable(results)
+        if isinstance(serializable_results, list):
+            for res in serializable_results:
+                if isinstance(res, dict):
+                    res['dpi'] = target_dpi
 
-        return {"ok": True, "results": _to_serializable(results)}
+        return {"ok": True, "results": serializable_results}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -412,31 +439,27 @@ def _process_pdf_page(pdf_bytes: bytes, page_num: int, device: str, model_dir: s
             return init_result
 
     try:
-        from PyPDF2 import PdfReader, PdfWriter
-        from io import BytesIO
-
-        # First, get total page count
-        pdf_reader = PdfReader(BytesIO(pdf_bytes))
-        total_pages = len(pdf_reader.pages)
-
-        # Validate page number
-        if page_num < 0 or page_num >= total_pages:
-            return {"ok": False, "error": f"Page {page_num} out of range (total: {total_pages})"}
-
-        # Extract ONLY the requested page
-        pdf_writer = PdfWriter()
-        pdf_writer.add_page(pdf_reader.pages[page_num])
-
-        # Write single page to buffer
-        single_page_buffer = BytesIO()
-        pdf_writer.write(single_page_buffer)
-        single_page_buffer.seek(0)
-        single_page_bytes = single_page_buffer.getvalue()
-
-        # Process only the single page
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
-            tmp.write(single_page_bytes)
-            tmp.flush()
+        from pdf2image import convert_from_bytes
+        
+        # Convert specific page to image at fixed DPI
+        target_dpi = 200
+        
+        # pdf2image uses 1-based indexing for first_page/last_page
+        images = convert_from_bytes(
+            pdf_bytes, 
+            dpi=target_dpi,
+            first_page=page_num + 1, 
+            last_page=page_num + 1
+        )
+        
+        if not images:
+            return {"ok": False, "error": f"Page {page_num} could not be rendered"}
+            
+        image = images[0]
+        
+        # Process the single page image
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
+            image.save(tmp.name)
             results = _MODEL.predict(tmp.name)
 
         # Enrich results with content in layout boxes
@@ -444,7 +467,18 @@ def _process_pdf_page(pdf_bytes: bytes, page_num: int, device: str, model_dir: s
 
         # Results should be a list with one element (the single page)
         if isinstance(results, list) and len(results) > 0:
-            return {"ok": True, "result": _to_serializable(results[0]), "total_pages": total_pages}
+            result = _to_serializable(results[0])
+            if isinstance(result, dict):
+                result['dpi'] = target_dpi
+            
+            # We need total pages count. pdf2image doesn't give it easily without reading the whole file.
+            # So we use PyPDF2 just for the count.
+            from PyPDF2 import PdfReader
+            from io import BytesIO
+            pdf_reader = PdfReader(BytesIO(pdf_bytes))
+            total_pages = len(pdf_reader.pages)
+            
+            return {"ok": True, "result": result, "total_pages": total_pages}
         else:
             return {"ok": False, "error": "Unexpected results format from single page"}
     except Exception as e:
