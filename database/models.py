@@ -2,7 +2,7 @@
 SQLAlchemy models for ArXiv database
 """
 
-from sqlalchemy import Column, String, Text, Date, TIMESTAMP, Boolean, ForeignKey, Index, func
+from sqlalchemy import Column, String, Text, Date, TIMESTAMP, Boolean, ForeignKey, Index, func, LargeBinary
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base, relationship
 from datetime import datetime
@@ -48,6 +48,9 @@ class ArxivPaper(Base):
 
     # PDF file path (see PDF_BASE_PATH in .env)
     pdf_path = Column(Text)
+
+    # PDF binary content (stored in database)
+    pdf_content = Column(LargeBinary, nullable=True)
 
     # PDF download tracking
     pdf_downloaded = Column(Boolean, default=False, server_default='false')
