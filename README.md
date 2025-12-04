@@ -1,11 +1,13 @@
 # ArXiv Database Project
 
-Python tooling for loading the arXiv metadata snapshot into PostgreSQL, downloading PDFs with status tracking, and running a PaddleOCR-VL pipeline (service + client + visualization).
+Python tooling for loading the arXiv metadata snapshot into PostgreSQL, storing PDFs directly in the database, and running a PaddleOCR-VL pipeline (service + client + visualization).
 
 ## What you can do
-- Load 1.7M+ arXiv JSONL records with upserts and category linking (`scripts/load_arxiv_data.py`)
-- Track and download PDFs with retries, rate limiting, and error logging (`scripts/download_pdfs.py`)
-- Reconcile DB download flags with what is actually on disk (`scripts/sync_pdf_status.py`)
+- **Process arXiv papers end-to-end** with a unified script (`scripts/process_arxiv.py`)
+  - Load metadata from JSONL into PostgreSQL
+  - Download PDFs directly into the database (BYTEA storage)
+  - Concurrent downloads with rate limiting
+  - Resume from where you left off automatically
 - Run a FastAPI PaddleOCR-VL service (GPU or CPU) that strips image payloads and exposes `/ocr` and `/ocr_page`
 - Send downloaded PDFs to the OCR service with resumable, page-by-page processing and JSON output (`scripts/ocr_client.py`)
 - Visualize OCR layout boxes over the source PDF (`scripts/visualize_ocr.py`)
@@ -14,7 +16,8 @@ Python tooling for loading the arXiv metadata snapshot into PostgreSQL, download
 ## Requirements
 - Python 3.8+
 - PostgreSQL 12+
-- ~5GB disk for the metadata JSON; additional space for PDFs and OCR outputs
+- ~5GB disk for the metadata JSON
+- Database storage for PDFs (expect ~0.37MB average per paper)
 - Optional GPU for PaddleOCR-VL (install `paddlepaddle-gpu` instead of `paddlepaddle`)
 
 Install dependencies:
@@ -37,9 +40,10 @@ Set environment variables directly or create a `.env` file (loaded by scripts vi
 | `DB_NAME` | Database name | `arxiv` |
 | `DB_USER` | Database user | `postgres` |
 | `DB_PASSWORD` | Database password | `""` |
-| `PDF_BASE_PATH` | Directory to store PDFs | `./arxiv_pdfs` |
 | `ARXIV_DATA_PATH` | Path to the metadata JSONL snapshot | `./arxiv-metadata-oai-snapshot.json` |
 | `DOWNLOAD_DELAY` | Seconds to sleep between PDF downloads | `3.0` |
+
+**Note:** PDFs are now stored directly in PostgreSQL as binary data (BYTEA). `PDF_BASE_PATH` is only used by legacy scripts.
 
 Unix socket example:
 ```
@@ -56,46 +60,113 @@ SQLALCHEMY_URL=postgresql://your_user:password@localhost:5432/arxiv
 ## Database setup
 ```bash
 createdb arxiv          # once
-alembic upgrade head    # apply migrations 001 + 002
-# (or psql -d arxiv -f schema.sql if you are avoiding Alembic)
+alembic upgrade head    # apply migrations (001, 002, 003)
 ```
 
-## Load metadata into Postgres
+Migrations:
+- `001`: Initial schema (papers, categories, relationships)
+- `002`: PDF download tracking columns
+- `003`: PDF binary storage (BYTEA column for storing PDFs in database)
+
+## Unified Processing Pipeline (Recommended)
+
+The `process_arxiv.py` script is the main entry point that handles metadata loading and PDF downloading in one go.
+
+### Starting from scratch (empty database)
 ```bash
-# Quick smoke test
+# Process first 5000 papers (metadata + PDFs)
+python scripts/process_arxiv.py --limit 5000 --workers 4
+```
+
+### Resume from where you left off
+```bash
+# Continue processing 5000 MORE papers (auto-resumes)
+python scripts/process_arxiv.py --limit 5000 --workers 4
+```
+The script automatically:
+- Checks what papers are already in the database
+- Skips those papers when reading the JSONL
+- Loads only NEW papers
+- Downloads PDFs for the new papers
+
+### Backfill missing PDFs
+If you have papers in the database but some don't have PDFs:
+```bash
+# Check how many papers need PDFs
+psql -d arxiv -c "SELECT COUNT(*) FROM arxiv_papers WHERE pdf_content IS NULL;"
+
+# Download PDFs for papers that don't have them
+python scripts/process_arxiv.py --skip-metadata --limit 3000 --workers 4
+```
+
+### Common scenarios
+
+**Scenario 1: You have 4056 papers in DB, only 1294 have PDFs**
+```bash
+# First, backfill the 2762 missing PDFs
+python scripts/process_arxiv.py --skip-metadata --limit 2762 --workers 4
+
+# Then continue loading new papers
+python scripts/process_arxiv.py --limit 5000 --workers 4
+```
+
+**Scenario 2: You want to load metadata only (no PDF downloads)**
+```bash
+python scripts/process_arxiv.py --limit 10000 --skip-download
+```
+
+**Scenario 3: Process everything with 8 concurrent workers**
+```bash
+python scripts/process_arxiv.py --limit 10000 --workers 8 --delay 2.0
+```
+
+### Pipeline features
+- **Automatic resume**: Skips papers already in database (use `--no-resume` to disable)
+- **Concurrent downloads**: Multi-threaded PDF downloads (default: 4 workers)
+- **Rate limiting**: Respects arXiv terms of service with configurable delays
+- **Error handling**: Tracks failed downloads with error messages for retry
+- **Progress tracking**: Real-time progress bars for metadata and PDFs
+- **Status syncing**: Automatically ensures `pdf_downloaded` flag matches `pdf_content` presence
+- **Database storage**: PDFs stored as binary data (BYTEA) directly in PostgreSQL
+
+### Check your progress
+```bash
+# Total papers
+psql -d arxiv -c "SELECT COUNT(*) as total FROM arxiv_papers;"
+
+# Papers with PDFs
+psql -d arxiv -c "SELECT COUNT(*) as with_pdfs FROM arxiv_papers WHERE pdf_content IS NOT NULL;"
+
+# Papers needing PDFs
+psql -d arxiv -c "SELECT COUNT(*) as need_pdfs FROM arxiv_papers WHERE pdf_content IS NULL;"
+
+# Failed downloads
+psql -d arxiv -c "SELECT COUNT(*) as failed FROM arxiv_papers WHERE pdf_download_error IS NOT NULL;"
+```
+
+## Legacy/Alternative Scripts
+
+The following individual scripts are still available if you need fine-grained control:
+
+### Load metadata only
+```bash
 python scripts/load_arxiv_data.py --max-records 1000
-
-# Full load with custom paths
-python scripts/load_arxiv_data.py \
-  --json-file "$ARXIV_DATA_PATH" \
-  --pdf-path "$PDF_BASE_PATH" \
-  --batch-size 2000
 ```
-Highlights:
-- Upserts on `id` (keeps existing `pdf_downloaded` flags and errors intact)
-- Generates `pdf_path` for each record using `PDF_BASE_PATH`
-- Rebuilds category links each batch; inserts new categories on the fly
-- Progress logging with records/sec
 
-## Download PDFs
+### Download PDFs to filesystem
 ```bash
-python scripts/download_pdfs.py \
-  --limit 200 \
-  --pdf-path "$PDF_BASE_PATH" \
-  --delay 3 \
-  --auto \
-  --categories cs.AI math. \
-  --retry-errors        # optional: include rows with past failures
+python scripts/download_pdfs.py --limit 200 --delay 3
 ```
-- Picks `pdf_downloaded = false` rows (skips past errors unless `--retry-errors`)
-- Respects `DOWNLOAD_DELAY`, retries HTTP up to `--retries`, and writes timestamps/errors
-- Simple category substring filter to throttle by subject area
 
-## Sync DB flags to the filesystem
+### Load filesystem PDFs into database
 ```bash
-python scripts/sync_pdf_status.py --pdf-path "$PDF_BASE_PATH" --chunk-size 2000
+python scripts/load_pdfs_to_db.py --limit 1000
 ```
-Scans the PDF directory and flips `pdf_downloaded` true/false in batches so the DB reflects what is actually on disk.
+
+### Sync status flags
+```bash
+python scripts/sync_pdf_status.py
+```
 
 ## PaddleOCR-VL service
 ```bash
@@ -149,13 +220,16 @@ alembic/
   versions/
     001_initial_schema.py
     002_add_pdf_download_tracking.py
+    003_add_pdf_binary_storage.py
 database/
   database.py          # URL builder, engine/session manager
-  models.py            # ORM models + indexes
+  models.py            # ORM models + indexes (includes pdf_content BYTEA)
 scripts/
-  load_arxiv_data.py   # JSONL -> Postgres loader (upsert + categories)
-  download_pdfs.py     # Download PDFs with retry/rate limiting
-  sync_pdf_status.py   # Reconcile pdf_downloaded with filesystem
+  process_arxiv.py     # Unified pipeline: metadata + PDF downloads (RECOMMENDED)
+  load_arxiv_data.py   # Legacy: JSONL -> Postgres loader
+  download_pdfs.py     # Legacy: Download PDFs to filesystem
+  load_pdfs_to_db.py   # Legacy: Load filesystem PDFs into database
+  sync_pdf_status.py   # Legacy: Reconcile pdf_downloaded flags
   ocr_service.py       # FastAPI PaddleOCR-VL service
   ocr_client.py        # Resumable page-by-page OCR client
   visualize_ocr.py     # Draw OCR boxes on PDF pages
@@ -166,10 +240,18 @@ README.md
 ```
 
 ## Notes & pitfalls
-- Large files: the JSON snapshot is ~5GB; PDFs will grow storage quickly
-- Socket vs TCP: empty `DB_HOST` builds a Unix-socket URL; set `DB_HOST=localhost` if peer auth fails
-- Respect arXiv rate limits when downloading PDFs
-- The OCR service expects models under `~/.paddlex/official_models` by default; first run will download them
+- **Large files**: The JSON snapshot is ~5GB; PDFs stored in PostgreSQL will grow your database significantly (expect ~0.37MB average per paper)
+- **Database storage**: With BYTEA storage, 10k papers = ~3.7GB database growth. Plan your PostgreSQL storage accordingly
+- **Socket vs TCP**: Empty `DB_HOST` builds a Unix-socket URL; set `DB_HOST=localhost` if peer auth fails
+- **Respect arXiv rate limits**: Default delay is 3 seconds between downloads. Do not decrease below 2 seconds
+- **Resume behavior**: The unified script automatically resumes from where it left off. To reload existing papers, use `--no-resume`
+- **Concurrent downloads**: More workers = faster processing, but respect rate limits. Recommended: 4-8 workers
+- **OCR models**: The OCR service expects models under `~/.paddlex/official_models` by default; first run will download them
+
+## Storage comparison
+- **Filesystem**: ~3.7GB for 10k PDFs on disk
+- **Database (BYTEA)**: ~3.7GB added to PostgreSQL database
+- **Advantage of DB storage**: Single source of truth, easier backups, no file path management, transactional consistency
 
 ## License
 Educational use only. See `LICENSE`.
