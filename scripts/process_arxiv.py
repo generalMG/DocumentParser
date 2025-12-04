@@ -90,9 +90,20 @@ class ArxivProcessor:
         except json.JSONDecodeError:
             return None
 
-    def load_metadata(self, limit: Optional[int] = None, batch_size: int = 2000):
+    def get_existing_paper_ids(self) -> set:
+        """Get all paper IDs that are already in the database."""
+        with self.db_manager.get_session() as session:
+            result = session.query(ArxivPaper.id).all()
+            return {row[0] for row in result}
+
+    def load_metadata(self, limit: Optional[int] = None, batch_size: int = 2000, resume: bool = True):
         """
         Load metadata from JSONL file into PostgreSQL.
+
+        Args:
+            limit: Maximum number of NEW papers to load
+            batch_size: Batch size for inserts
+            resume: If True, skip papers already in database
 
         Returns:
             List of paper IDs that were loaded
@@ -104,7 +115,15 @@ class ArxivProcessor:
         if not Path(self.arxiv_json_path).exists():
             raise FileNotFoundError(f"ArXiv metadata file not found: {self.arxiv_json_path}")
 
+        # Get existing paper IDs if resuming
+        existing_ids = set()
+        if resume:
+            print("Checking for existing papers in database...")
+            existing_ids = self.get_existing_paper_ids()
+            print(f"✓ Found {len(existing_ids)} papers already in database")
+
         loaded_ids = []
+        skipped_count = 0
         total_processed = 0
 
         with open(self.arxiv_json_path, 'r', encoding='utf-8') as f:
@@ -121,6 +140,11 @@ class ArxivProcessor:
 
                 paper_id = record.get('id')
                 if not paper_id:
+                    continue
+
+                # Skip if already exists and we're resuming
+                if resume and paper_id in existing_ids:
+                    skipped_count += 1
                     continue
 
                 # Parse categories
@@ -160,7 +184,9 @@ class ArxivProcessor:
             if batch_papers:
                 self._insert_batch(batch_papers, batch_categories)
 
-        print(f"✓ Loaded {total_processed} metadata records")
+        print(f"✓ Loaded {total_processed} new metadata records")
+        if skipped_count > 0:
+            print(f"✓ Skipped {skipped_count} papers already in database")
         return loaded_ids
 
     def _insert_batch(self, papers: List[Dict], categories: set):
@@ -336,7 +362,20 @@ class ArxivProcessor:
             else:
                 print("✓ All records are already in sync")
 
-    def process(self, limit: Optional[int] = None, skip_metadata: bool = False, skip_download: bool = False):
+    def get_papers_needing_pdfs(self, limit: Optional[int] = None) -> List[str]:
+        """Get paper IDs that are in database but don't have PDFs yet."""
+        with self.db_manager.get_session() as session:
+            query = session.query(ArxivPaper.id).filter(
+                ArxivPaper.pdf_content.is_(None)
+            ).order_by(ArxivPaper.id)
+
+            if limit:
+                query = query.limit(limit)
+
+            paper_ids = [row[0] for row in query.all()]
+            return paper_ids
+
+    def process(self, limit: Optional[int] = None, skip_metadata: bool = False, skip_download: bool = False, resume: bool = True):
         """
         Main processing pipeline.
 
@@ -344,6 +383,7 @@ class ArxivProcessor:
             limit: Maximum number of papers to process
             skip_metadata: Skip metadata loading step
             skip_download: Skip PDF download step
+            resume: Resume from where left off (skip existing papers)
         """
         # Step 1: Run migrations
         if not skip_metadata:
@@ -351,19 +391,17 @@ class ArxivProcessor:
 
         # Step 2: Load metadata
         if skip_metadata:
-            print("\nSkipping metadata loading...")
-            with self.db_manager.get_session() as session:
-                query = session.query(ArxivPaper.id).filter(
-                    ArxivPaper.pdf_downloaded.is_(False)
-                )
-                if limit:
-                    query = query.limit(limit)
-                paper_ids = [row[0] for row in query.all()]
+            print("\nSkipping metadata loading, finding papers needing PDFs...")
+            paper_ids = self.get_papers_needing_pdfs(limit=limit)
+            print(f"✓ Found {len(paper_ids)} papers without PDFs")
         else:
-            paper_ids = self.load_metadata(limit=limit)
+            paper_ids = self.load_metadata(limit=limit, resume=resume)
 
         if not paper_ids:
-            print("No papers to process.")
+            if skip_metadata:
+                print("No papers need PDFs. All papers in database already have PDFs!")
+            else:
+                print("No new papers to process.")
             return
 
         # Step 3: Download PDFs
@@ -435,6 +473,12 @@ Examples:
     )
 
     parser.add_argument(
+        '--no-resume',
+        action='store_true',
+        help='Do not resume (reload existing papers instead of skipping them)'
+    )
+
+    parser.add_argument(
         '--db-url',
         default=None,
         help='Database URL (default: from .env SQLALCHEMY_URL)'
@@ -457,7 +501,8 @@ Examples:
     processor.process(
         limit=args.limit,
         skip_metadata=args.skip_metadata,
-        skip_download=args.skip_download
+        skip_download=args.skip_download,
+        resume=not args.no_resume
     )
 
 
