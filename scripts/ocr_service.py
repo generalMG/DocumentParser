@@ -647,6 +647,17 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/info")
+async def info():
+    """Return service configuration info including worker count."""
+    return {
+        "status": "ok",
+        "workers": SERVICE_ARGS.workers if SERVICE_ARGS else 0,
+        "device": SERVICE_ARGS.device if SERVICE_ARGS else "unknown",
+        "pool_ready": POOL is not None,
+    }
+
+
 @app.post("/ocr")
 async def ocr_endpoint(
     file: UploadFile = File(...),
