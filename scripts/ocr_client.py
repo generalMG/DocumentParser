@@ -134,14 +134,43 @@ def _extract_page_index(result: dict, fallback_index: int) -> int:
     return fallback_index
 
 
+def _process_single_page(
+    paper_id: str,
+    pdf_bytes: bytes,
+    page_num: int,
+    service_url: str,
+) -> Tuple[int, Optional[dict], Optional[str], Optional[int]]:
+    """Process a single page. Returns (page_num, result, error, total_pages)."""
+    try:
+        files = {"file": (f"{paper_id}.pdf", pdf_bytes, "application/pdf")}
+        data = {"page": page_num}
+        resp = requests.post(service_url, files=files, data=data, timeout=6000)
+    except Exception as e:
+        return (page_num, None, f"request failed: {e}", None)
+
+    if resp.status_code != 200:
+        return (page_num, None, f"service error {resp.status_code}: {resp.text}", None)
+
+    try:
+        payload = resp.json()
+    except Exception as e:
+        return (page_num, None, f"failed to parse JSON: {e}", None)
+
+    total_pages = payload.get("total_pages")
+    page_result = payload.get("result")
+
+    return (page_num, page_result, None, total_pages)
+
+
 def process_pdf_to_db(
     db: DatabaseManager,
     paper_id: str,
     pdf_bytes: bytes,
     service_url: str,
     max_pages: int = None,
+    gpu_workers: int = 1,
 ) -> bool:
-    """Process a single PDF page by page and save results to database."""
+    """Process a single PDF with concurrent page processing."""
 
     # Load existing partial results for resume support
     existing_data = get_partial_results(db, paper_id)
@@ -156,83 +185,83 @@ def process_pdf_to_db(
             results_dict[page_num] = r
             completed_pages.add(page_num)
         if completed_pages:
-            next_page = max(completed_pages) + 1
-            print(f"{paper_id}: resuming from page {next_page} (already completed: {len(completed_pages)} pages)")
-            # Clear any previous error since we're resuming
+            print(f"  Resuming: {len(completed_pages)} pages already completed")
             save_ocr_results(db, paper_id, existing_data, clear_error=True)
 
-    page_num = 0
-    while True:
-        # Skip already completed pages
-        if page_num in completed_pages:
-            page_num += 1
-            # Check termination conditions
-            if max_pages and page_num >= max_pages:
-                break
-            if total_pages and page_num >= total_pages:
-                break
-            continue
-
-        # Send request to OCR service
-        try:
-            files = {"file": (f"{paper_id}.pdf", pdf_bytes, "application/pdf")}
-            data = {"page": page_num}
-            resp = requests.post(service_url, files=files, data=data, timeout=6000)
-        except Exception as e:
-            error_msg = f"page {page_num} request failed: {e}"
-            print(f"{paper_id}: {error_msg}")
-            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), error=error_msg)
-            return False
-
-        if resp.status_code != 200:
-            error_msg = f"page {page_num} service error {resp.status_code}: {resp.text}"
-            print(f"{paper_id}: {error_msg}")
-            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), error=error_msg)
-            return False
-
-        try:
-            payload = resp.json()
-        except Exception as e:
-            error_msg = f"page {page_num} failed to parse JSON: {e}"
-            print(f"{paper_id}: {error_msg}")
-            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), error=error_msg)
-            return False
-
-        # Extract total pages from first response
+    # First, get total pages if we don't know it yet
+    if total_pages is None:
+        page_num, result, error, total_pages = _process_single_page(
+            paper_id, pdf_bytes, 0, service_url
+        )
         if total_pages is None:
-            total_pages = payload.get("total_pages")
-            if total_pages is None:
-                error_msg = "could not determine total pages"
-                print(f"{paper_id}: {error_msg}")
-                save_ocr_results(db, paper_id, {}, error=error_msg)
-                return False
-            print(f"{paper_id}: total pages = {total_pages}")
+            error_msg = error or "could not determine total pages"
+            print(f"  Error: {error_msg}")
+            save_ocr_results(db, paper_id, {}, error=error_msg)
+            return False
 
-        # Store page result
-        page_result = payload.get("result")
-        if page_result is not None:
-            results_dict[page_num] = page_result
-            completed_pages.add(page_num)
+        if result is not None:
+            results_dict[0] = result
+            completed_pages.add(0)
 
-            # Save incrementally to database
-            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages))
-            print(f"{paper_id}: page {page_num + 1}/{total_pages} completed")
+        print(f"  Total pages: {total_pages}")
 
-        page_num += 1
+    # Determine which pages still need processing
+    target_pages = min(total_pages, max_pages) if max_pages else total_pages
+    pages_to_process = [p for p in range(target_pages) if p not in completed_pages]
 
-        # Check termination conditions
-        if max_pages and page_num >= max_pages:
-            break
-        if page_num >= total_pages:
-            break
-
-    # Mark as completed
-    is_complete = len(completed_pages) >= total_pages or (max_pages and len(completed_pages) >= max_pages)
-    if is_complete:
+    if not pages_to_process:
+        print(f"  All pages already completed")
         save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), completed=True)
-        print(f"{paper_id}: processing complete")
+        return True
 
-    return True
+    print(f"  Processing {len(pages_to_process)} pages with {gpu_workers} concurrent worker(s)...")
+
+    # Process pages concurrently
+    with ThreadPoolExecutor(max_workers=gpu_workers) as executor:
+        futures = {
+            executor.submit(
+                _process_single_page,
+                paper_id,
+                pdf_bytes,
+                page_num,
+                service_url,
+            ): page_num
+            for page_num in pages_to_process
+        }
+
+        processed = 0
+        errors = []
+
+        for future in as_completed(futures):
+            page_num = futures[future]
+            try:
+                pg, result, error, _ = future.result()
+
+                if error:
+                    errors.append(f"page {pg}: {error}")
+                    print(f"  Page {pg + 1}/{total_pages}: ERROR - {error}")
+                elif result is not None:
+                    results_dict[pg] = result
+                    completed_pages.add(pg)
+                    processed += 1
+                    print(f"  Page {pg + 1}/{total_pages}: OK ({processed}/{len(pages_to_process)})")
+
+            except Exception as e:
+                errors.append(f"page {page_num}: exception {e}")
+                print(f"  Page {page_num + 1}/{total_pages}: EXCEPTION - {e}")
+
+        # Save results after all pages complete
+        if errors:
+            error_msg = "; ".join(errors[:3])  # First 3 errors
+            if len(errors) > 3:
+                error_msg += f" (+{len(errors) - 3} more)"
+            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), error=error_msg)
+            print(f"  Completed with {len(errors)} error(s)")
+            return False
+        else:
+            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), completed=True)
+            print(f"  Completed successfully")
+            return True
 
 
 def _build_results(results_dict: dict, total_pages: int = None) -> dict:
@@ -245,28 +274,6 @@ def _build_results(results_dict: dict, total_pages: int = None) -> dict:
     return output
 
 
-def process_single_paper(
-    db: DatabaseManager,
-    paper_id: str,
-    service_url: str,
-    max_pages: int = None,
-) -> Tuple[str, bool]:
-    """Process a single paper. Returns (paper_id, success)."""
-    pdf_bytes = get_pdf_content(db, paper_id)
-    if not pdf_bytes:
-        print(f"{paper_id}: no PDF content in database, skipping")
-        return (paper_id, False)
-
-    success = process_pdf_to_db(
-        db=db,
-        paper_id=paper_id,
-        pdf_bytes=pdf_bytes,
-        service_url=service_url,
-        max_pages=max_pages,
-    )
-    return (paper_id, success)
-
-
 def main():
     parser = argparse.ArgumentParser(description="Process PDFs from database through OCR service")
     parser.add_argument("--service-url", default="http://localhost:8000/ocr_page", help="OCR service endpoint")
@@ -274,7 +281,7 @@ def main():
     parser.add_argument("--limit", type=int, default=10, help="Max number of PDFs to process")
     parser.add_argument("--offset", type=int, default=0, help="Offset for DB query")
     parser.add_argument("--gpu-workers", type=int, default=None,
-                        help="Number of concurrent papers to process (default: auto-detect from OCR service)")
+                        help="Number of concurrent pages to process (default: auto-detect from OCR service)")
     parser.add_argument("--retry-errors", action="store_true", help="Retry papers that previously failed with errors")
     parser.add_argument("--db-url", default=os.getenv("SQLALCHEMY_URL"), help="Optional DB URL override")
     parser.add_argument("--db-host", default=os.getenv("DB_HOST", ""), help="DB host")
@@ -320,39 +327,34 @@ def main():
     success_count = 0
     fail_count = 0
 
-    # Process papers concurrently using ThreadPoolExecutor
-    print(f"\nProcessing {len(paper_ids)} papers with {gpu_workers} concurrent worker(s)...")
-    print("=" * 60)
+    # Process papers sequentially, but pages concurrently
+    for i, paper_id in enumerate(paper_ids, 1):
+        print(f"\n[{i}/{len(paper_ids)}] {paper_id}")
+        print("-" * 50)
 
-    with ThreadPoolExecutor(max_workers=gpu_workers) as executor:
-        # Submit all papers for processing
-        futures = {
-            executor.submit(
-                process_single_paper,
-                db,
-                paper_id,
-                args.service_url,
-                args.pages,
-            ): paper_id
-            for paper_id in paper_ids
-        }
+        pdf_bytes = get_pdf_content(db, paper_id)
+        if not pdf_bytes:
+            print(f"  No PDF content in database, skipping")
+            fail_count += 1
+            continue
 
-        # Process results as they complete
-        for future in as_completed(futures):
-            paper_id = futures[future]
-            try:
-                _, success = future.result()
-                if success:
-                    success_count += 1
-                else:
-                    fail_count += 1
-            except Exception as e:
-                print(f"{paper_id}: exception during processing: {e}")
-                fail_count += 1
+        success = process_pdf_to_db(
+            db=db,
+            paper_id=paper_id,
+            pdf_bytes=pdf_bytes,
+            service_url=args.service_url,
+            max_pages=args.pages,
+            gpu_workers=gpu_workers,
+        )
 
-    print(f"\n{'='*60}")
-    print(f"Processing complete: {success_count} succeeded, {fail_count} failed")
-    print('='*60)
+        if success:
+            success_count += 1
+        else:
+            fail_count += 1
+
+    print(f"\n{'='*50}")
+    print(f"Done: {success_count} succeeded, {fail_count} failed")
+    print('='*50)
 
 
 if __name__ == "__main__":
