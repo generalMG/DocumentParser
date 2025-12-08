@@ -4,6 +4,7 @@ FastAPI service that hosts PaddleOCR-VL and processes uploaded PDFs.
 
 - Keeps a pool of PaddleOCR-VL instances (one per process).
 - Accepts PDF uploads and returns OCR results as JSON.
+- Accepts pre-rendered page images to avoid redundant PDF rendering.
 - Model paths are read from a local directory (pre-downloaded).
 """
 
@@ -14,6 +15,7 @@ import os
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
+from io import BytesIO
 from typing import Any, List, Optional
 import traceback
 import logging
@@ -589,6 +591,76 @@ def _process_pdf_page(pdf_bytes: bytes, page_num: int, device: str, model_dir: s
         _cleanup_gpu_memory()
 
 
+def _extract_image_dpi(image) -> Optional[int]:
+    """Best-effort extraction of DPI metadata from a PIL image."""
+    dpi_info = getattr(image, "info", {}).get("dpi")
+    if isinstance(dpi_info, (list, tuple)) and dpi_info:
+        try:
+            return int(round(float(dpi_info[0])))
+        except Exception:
+            return None
+    return None
+
+
+def _process_image_bytes(
+    image_bytes: bytes,
+    page_index: Optional[int],
+    dpi: Optional[int],
+    device: str,
+    model_dir: str
+) -> dict:
+    """Worker: process a pre-rendered image. Avoids re-rendering the PDF server-side."""
+    global _MODEL
+
+    if "_MODEL" not in globals() or _MODEL is None:
+        init_result = _init_model_worker(device, model_dir)
+        if not init_result["ok"]:
+            return init_result
+
+    image = None
+    try:
+        from PIL import Image
+
+        image = Image.open(BytesIO(image_bytes))
+        image_dpi = _extract_image_dpi(image)
+
+        # Normalize to RGB to avoid mode issues when saving temp files
+        if image.mode not in ("RGB", "RGBA"):
+            image = image.convert("RGB")
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
+            image.save(tmp.name)
+            results = _MODEL.predict(tmp.name)
+
+        results = _enrich_results(results)
+
+        if isinstance(results, list) and len(results) > 0:
+            result = _to_serializable(results[0])
+        else:
+            result = _to_serializable(results)
+
+        if isinstance(result, dict):
+            effective_dpi = dpi or image_dpi
+            if effective_dpi:
+                result["dpi"] = effective_dpi
+            if page_index is not None:
+                result["page_index"] = page_index
+
+        return {"ok": True, "result": result}
+    except Exception as e:
+        error_trace = traceback.format_exc()
+        return {"ok": False, "error": f"{str(e)}\n{error_trace}"}
+    finally:
+        if image:
+            try:
+                image.close()
+            except Exception:
+                pass
+            del image
+
+        _cleanup_gpu_memory()
+
+
 @app.on_event("startup")
 async def _startup():
     global POOL
@@ -733,6 +805,45 @@ async def ocr_page_endpoint(
 
     logger.info(f"OCR page successful for {file.filename} page {page}/{result.get('total_pages')}")
     return JSONResponse({"result": result.get("result"), "total_pages": result.get("total_pages")})
+
+
+@app.post("/ocr_image")
+async def ocr_image_endpoint(
+    file: UploadFile = File(...),
+    page: Optional[int] = Form(None),
+    dpi: Optional[int] = Form(None),
+):
+    logger.info(f"OCR image request received: filename={file.filename}, page={page}, dpi={dpi}")
+
+    if POOL is None:
+        logger.error("Worker pool not ready")
+        raise HTTPException(status_code=503, detail="Worker pool not ready")
+
+    try:
+        data = await file.read()
+        logger.info(f"Read {len(data)} bytes from {file.filename} for page {page}")
+    except Exception as e:
+        logger.error(f"Failed to read file {file.filename}: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
+
+    loop = asyncio.get_running_loop()
+    try:
+        logger.info(f"Submitting OCR image task for {file.filename} page {page}")
+        result = await loop.run_in_executor(
+            POOL, _process_image_bytes, data, page, dpi, SERVICE_ARGS.device, SERVICE_ARGS.model_dir
+        )
+        logger.info(f"OCR image task completed for {file.filename} page {page}")
+    except Exception as e:
+        logger.error(f"OCR image execution failed for {file.filename} page {page}: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
+
+    if not result.get("ok"):
+        error_msg = result.get('error', 'Unknown error')
+        logger.error(f"OCR image processing failed for {file.filename} page {page}: {error_msg}")
+        raise HTTPException(status_code=500, detail=f"OCR failed: {error_msg}")
+
+    logger.info(f"OCR image successful for {file.filename} page {page}")
+    return JSONResponse({"result": result.get("result")})
 
 
 def parse_args():

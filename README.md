@@ -25,7 +25,7 @@ Install dependencies:
 python -m venv .venv && source .venv/bin/activate  # optional but recommended
 pip install -r requirements.txt
 ```
-`fastapi`, `uvicorn`, `requests`, `PyPDF2`, `reportlab`, and PaddleOCR packages are needed for the OCR pipeline.
+`fastapi`, `uvicorn`, `requests`, `PyPDF2`, `pdf2image`, `reportlab`, and PaddleOCR packages are needed for the OCR pipeline.
 ### Recommendation
 Use `uv package manager` for faster and more reliable installation.
 
@@ -189,7 +189,8 @@ python scripts/ocr_service.py --device cpu --workers 1
   - `/health` - Health check
   - `/info` - Service info (worker count, device, pool status)
   - `/ocr` - Process whole PDFs (optionally limited by `pages` form field)
-  - `/ocr_page` - Process a single page (returns `total_pages`)
+  - `/ocr_page` - Process a single page from a PDF (returns `total_pages`)
+  - `/ocr_image` - Process a single pre-rendered page image (PNG/JPEG) to avoid repeated PDF rendering
 - Filters out image blobs for lean JSON output
 - Injects DPI info for coordinate accuracy
 - Automatic GPU memory cleanup after each page (prevents VRAM leaks)
@@ -206,6 +207,9 @@ python scripts/ocr_client.py --limit 100
 # Limit pages per PDF
 python scripts/ocr_client.py --limit 100 --pages 10
 
+# Cap rendered pages to avoid OOM on huge PDFs (default 100)
+python scripts/ocr_client.py --limit 100 --render-page-limit 100
+
 # Override worker count
 python scripts/ocr_client.py --limit 100 --gpu-workers 2
 
@@ -215,6 +219,8 @@ python scripts/ocr_client.py --limit 100 --retry-errors
 
 ### Client features
 - **Database storage**: OCR results saved as JSONB directly in PostgreSQL (no local files)
+- **Client-side rendering**: Pre-renders PDF pages to images once, cutting bandwidth ~25x vs sending PDFs repeatedly
+- **CPU/GPU pipeline**: Renders the next PDF while GPU OCR runs on the current one (queue size 1) and caps rendering to 100 pages by default to avoid OOM
 - **Concurrent page processing**: Processes N pages simultaneously (auto-detects from service)
 - **Resume support**: Automatically resumes from last processed page if interrupted
 - **Progress tracking**: Clean per-paper logging with page progress

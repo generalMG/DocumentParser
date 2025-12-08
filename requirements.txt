@@ -14,6 +14,7 @@ fastapi
 uvicorn
 requests
 PyPDF2  # PDF page extraction
+pdf2image  # PDF -> image rendering for OCR pipeline
 reportlab  # PDF generation for warm-up
 nvidia-ml-py  # GPU monitoring (replaces deprecated pynvml)
 # Optional OCR (PaddleOCR-VL)

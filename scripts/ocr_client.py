@@ -3,7 +3,9 @@
 OCR client that fetches PDFs from database and stores results back to database.
 
 - Pulls papers with pdf_content (PDF stored in DB) that haven't been OCR processed yet
-- Sends each PDF to the FastAPI OCR service
+- Pre-renders PDF pages to images and sends them to the FastAPI OCR service
+- Pipelines CPU rendering of the next PDF while GPU processes the current one (queue size 1)
+- Caps rendering to 100 pages by default to avoid OOM on very long PDFs
 - Saves OCR results directly to the database (ocr_results JSONB column)
 - Tracks processing status via ocr_processed, ocr_processed_at, ocr_error columns
 """
@@ -13,10 +15,13 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
+from pdf2image import convert_from_bytes
+from PyPDF2 import PdfReader
 from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -25,11 +30,14 @@ from database.models import ArxivPaper  # noqa: E402
 
 load_dotenv(override=True)
 
+DEFAULT_RENDER_DPI = 200
+RENDER_PAGE_LIMIT = 100
+
 
 def get_service_info(service_url: str) -> dict:
     """Query OCR service for configuration info including worker count."""
     try:
-        # Convert /ocr_page URL to /info URL
+        # Convert endpoint URL to /info URL
         base_url = service_url.rsplit('/', 1)[0]
         info_url = f"{base_url}/info"
         resp = requests.get(info_url, timeout=10)
@@ -134,32 +142,101 @@ def _extract_page_index(result: dict, fallback_index: int) -> int:
     return fallback_index
 
 
-def _process_single_page(
+def _get_pdf_total_pages(pdf_bytes: bytes) -> int:
+    """Return total page count for a PDF."""
+    reader = PdfReader(BytesIO(pdf_bytes))
+    return len(reader.pages)
+
+
+def _render_pdf_to_images(
+    pdf_bytes: bytes,
+    target_pages: int,
+    dpi: int = DEFAULT_RENDER_DPI
+) -> Dict[int, bytes]:
+    """Render PDF pages to PNG bytes once client-side to avoid repeated server renders."""
+    images = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=target_pages)
+    rendered = {}
+
+    for idx, image in enumerate(images):
+        with BytesIO() as buf:
+            image.save(buf, format="PNG")
+            rendered[idx] = buf.getvalue()
+        image.close()
+
+    return rendered
+
+
+def _prepare_render_job(
     paper_id: str,
     pdf_bytes: bytes,
-    page_num: int,
-    service_url: str,
-) -> Tuple[int, Optional[dict], Optional[str], Optional[int]]:
-    """Process a single page. Returns (page_num, result, error, total_pages)."""
+    max_pages: Optional[int],
+    render_page_limit: int,
+    dpi: int,
+) -> dict:
+    """Prepare a PDF for GPU processing by rendering pages to images. Runs in a thread."""
     try:
-        files = {"file": (f"{paper_id}.pdf", pdf_bytes, "application/pdf")}
-        data = {"page": page_num}
+        total_pages = _get_pdf_total_pages(pdf_bytes)
+    except Exception as e:
+        return {"ok": False, "error": f"could not determine total pages: {e}"}
+
+    target_pages = min(total_pages, max_pages) if max_pages else total_pages
+    if render_page_limit:
+        if target_pages > render_page_limit:
+            target_pages = render_page_limit
+            capped = True
+        else:
+            capped = False
+    else:
+        capped = False
+
+    if target_pages <= 0:
+        return {"ok": False, "error": "no pages to process after applying limits"}
+
+    try:
+        page_images = _render_pdf_to_images(pdf_bytes, target_pages, dpi=dpi)
+    except Exception as e:
+        return {"ok": False, "error": f"failed to render PDF to images: {e}"}
+
+    return {
+        "ok": True,
+        "paper_id": paper_id,
+        "page_images": page_images,
+        "total_pages": total_pages,
+        "target_pages": target_pages,
+        "render_dpi": dpi,
+        "capped": capped,
+    }
+
+
+def _process_single_image(
+    paper_id: str,
+    page_num: int,
+    image_bytes: bytes,
+    service_url: str,
+    dpi: int,
+) -> Tuple[int, Optional[dict], Optional[str]]:
+    """Send a pre-rendered page image to the OCR service. Returns (page_num, result, error)."""
+    if not image_bytes:
+        return (page_num, None, "missing rendered image bytes")
+
+    try:
+        files = {"file": (f"{paper_id}_page_{page_num + 1}.png", image_bytes, "image/png")}
+        data = {"page": page_num, "dpi": dpi}
         resp = requests.post(service_url, files=files, data=data, timeout=6000)
     except Exception as e:
-        return (page_num, None, f"request failed: {e}", None)
+        return (page_num, None, f"request failed: {e}")
 
     if resp.status_code != 200:
-        return (page_num, None, f"service error {resp.status_code}: {resp.text}", None)
+        return (page_num, None, f"service error {resp.status_code}: {resp.text}")
 
     try:
         payload = resp.json()
     except Exception as e:
-        return (page_num, None, f"failed to parse JSON: {e}", None)
+        return (page_num, None, f"failed to parse JSON: {e}")
 
-    total_pages = payload.get("total_pages")
     page_result = payload.get("result")
 
-    return (page_num, page_result, None, total_pages)
+    return (page_num, page_result, None)
 
 
 def process_pdf_to_db(
@@ -169,6 +246,11 @@ def process_pdf_to_db(
     service_url: str,
     max_pages: int = None,
     gpu_workers: int = 1,
+    page_images: Optional[Dict[int, bytes]] = None,
+    total_pages: Optional[int] = None,
+    target_pages: Optional[int] = None,
+    render_dpi: int = DEFAULT_RENDER_DPI,
+    render_page_limit: int = RENDER_PAGE_LIMIT,
 ) -> bool:
     """Process a single PDF with concurrent page processing."""
 
@@ -176,7 +258,7 @@ def process_pdf_to_db(
     existing_data = get_partial_results(db, paper_id)
     results_dict = {}
     completed_pages = set()
-    total_pages = existing_data.get("total_pages")
+    total_pages = total_pages or existing_data.get("total_pages")
 
     # Restore previously processed pages
     if existing_data.get("results"):
@@ -188,32 +270,63 @@ def process_pdf_to_db(
             print(f"  Resuming: {len(completed_pages)} pages already completed")
             save_ocr_results(db, paper_id, existing_data, clear_error=True)
 
-    # First, get total pages if we don't know it yet
+    # Get total pages locally to avoid server-side PDF rendering
     if total_pages is None:
-        page_num, result, error, total_pages = _process_single_page(
-            paper_id, pdf_bytes, 0, service_url
-        )
-        if total_pages is None:
-            error_msg = error or "could not determine total pages"
+        try:
+            total_pages = _get_pdf_total_pages(pdf_bytes)
+            print(f"  Total pages: {total_pages}")
+        except Exception as e:
+            error_msg = f"could not determine total pages: {e}"
             print(f"  Error: {error_msg}")
             save_ocr_results(db, paper_id, {}, error=error_msg)
             return False
 
-        if result is not None:
-            results_dict[0] = result
-            completed_pages.add(0)
-            print(f"  Total pages: {total_pages} (page 1 done)")
-        else:
-            print(f"  Total pages: {total_pages}")
+    if not total_pages:
+        error_msg = "could not determine total pages"
+        print(f"  Error: {error_msg}")
+        save_ocr_results(db, paper_id, {}, error=error_msg)
+        return False
+
+    # Determine how many pages to process (respect render limit and CLI max_pages)
+    effective_target = target_pages
+    if effective_target is None:
+        effective_target = min(total_pages, max_pages) if max_pages else total_pages
+    if render_page_limit:
+        if effective_target > render_page_limit:
+            print(f"  Capping pages to {render_page_limit} to avoid OOM")
+            effective_target = render_page_limit
+
+    if effective_target <= 0:
+        error_msg = "no pages to process after applying limits"
+        print(f"  Error: {error_msg}")
+        save_ocr_results(db, paper_id, {}, error=error_msg)
+        return False
 
     # Determine which pages still need processing
-    target_pages = min(total_pages, max_pages) if max_pages else total_pages
-    pages_to_process = [p for p in range(target_pages) if p not in completed_pages]
+    pages_to_process = [p for p in range(effective_target) if p not in completed_pages]
 
     if not pages_to_process:
         print(f"  All pages already completed")
         save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), completed=True)
         return True
+
+    # Render pages client-side once to avoid re-sending the PDF for each page
+    if page_images is None:
+        try:
+            page_images = _render_pdf_to_images(pdf_bytes, effective_target, dpi=render_dpi)
+            print(f"  Rendered {len(page_images)} page(s) at {render_dpi} DPI")
+        except Exception as e:
+            error_msg = f"failed to render PDF to images: {e}"
+            print(f"  Error: {error_msg}")
+            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), error=error_msg)
+            return False
+
+    missing_images = [p for p in pages_to_process if p not in page_images]
+    if missing_images:
+        error_msg = f"rendered images missing for pages: {missing_images}"
+        print(f"  Error: {error_msg}")
+        save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), error=error_msg)
+        return False
 
     print(f"  Processing {len(pages_to_process)} pages with {gpu_workers} concurrent worker(s)...")
 
@@ -221,11 +334,12 @@ def process_pdf_to_db(
     with ThreadPoolExecutor(max_workers=gpu_workers) as executor:
         futures = {
             executor.submit(
-                _process_single_page,
+                _process_single_image,
                 paper_id,
-                pdf_bytes,
                 page_num,
+                page_images.get(page_num),
                 service_url,
+                render_dpi,
             ): page_num
             for page_num in pages_to_process
         }
@@ -236,7 +350,7 @@ def process_pdf_to_db(
         for future in as_completed(futures):
             page_num = futures[future]
             try:
-                pg, result, error, _ = future.result()
+                pg, result, error = future.result()
 
                 if error:
                     errors.append(f"page {pg}: {error}")
@@ -255,8 +369,7 @@ def process_pdf_to_db(
                 print(f"  Page {page_num + 1}/{total_pages}: EXCEPTION - {e}")
 
     # Final save: set completed=True only if ALL pages done and no errors
-    target_pages = min(total_pages, max_pages) if max_pages else total_pages
-    all_done = len(completed_pages) >= target_pages
+    all_done = len(completed_pages) >= effective_target
 
     if errors:
         error_msg = "; ".join(errors[:3])
@@ -272,7 +385,7 @@ def process_pdf_to_db(
     else:
         # Partial completion (shouldn't happen normally, but safety check)
         save_ocr_results(db, paper_id, _build_results(results_dict, total_pages))
-        print(f"  Partial: {len(completed_pages)}/{target_pages} pages")
+        print(f"  Partial: {len(completed_pages)}/{effective_target} pages")
         return False
 
 
@@ -288,13 +401,19 @@ def _build_results(results_dict: dict, total_pages: int = None) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Process PDFs from database through OCR service")
-    parser.add_argument("--service-url", default="http://localhost:8000/ocr_page", help="OCR service endpoint")
+    parser.add_argument(
+        "--service-url",
+        default="http://localhost:8000/ocr_image",
+        help="OCR service endpoint (use /ocr_image to send pre-rendered pages)",
+    )
     parser.add_argument("--pages", type=int, default=None, help="Max pages per PDF (default: all)")
     parser.add_argument("--limit", type=int, default=10, help="Max number of PDFs to process")
     parser.add_argument("--offset", type=int, default=0, help="Offset for DB query")
     parser.add_argument("--gpu-workers", type=int, default=None,
                         help="Number of concurrent pages to process (default: auto-detect from OCR service)")
     parser.add_argument("--retry-errors", action="store_true", help="Retry papers that previously failed with errors")
+    parser.add_argument("--render-page-limit", type=int, default=RENDER_PAGE_LIMIT,
+                        help="Max pages to render per PDF to avoid OOM (default: 100)")
     parser.add_argument("--db-url", default=os.getenv("SQLALCHEMY_URL"), help="Optional DB URL override")
     parser.add_argument("--db-host", default=os.getenv("DB_HOST", ""), help="DB host")
     parser.add_argument("--db-port", type=int, default=int(os.getenv("DB_PORT", "5432")), help="DB port")
@@ -339,30 +458,110 @@ def main():
     success_count = 0
     fail_count = 0
 
-    # Process papers sequentially, but pages concurrently
+    # Pipeline: render next PDF while GPU processes current PDF pages
+    render_executor = ThreadPoolExecutor(max_workers=2)
+
+    def schedule_render(p_id: str, pdf_bytes: Optional[bytes]):
+        if not pdf_bytes:
+            return None
+        return render_executor.submit(
+            _prepare_render_job,
+            p_id,
+            pdf_bytes,
+            args.pages,
+            args.render_page_limit,
+            DEFAULT_RENDER_DPI,
+        )
+
+    current_pdf_bytes = None
+    current_render_future = None
+
+    if paper_ids:
+        first_id = paper_ids[0]
+        current_pdf_bytes = get_pdf_content(db, first_id)
+        if current_pdf_bytes:
+            current_render_future = schedule_render(first_id, current_pdf_bytes)
     for i, paper_id in enumerate(paper_ids, 1):
         print(f"\n[{i}/{len(paper_ids)}] {paper_id}")
         print("-" * 50)
 
-        pdf_bytes = get_pdf_content(db, paper_id)
-        if not pdf_bytes:
-            print(f"  No PDF content in database, skipping")
+        # Ensure we have a render job for this paper; try to start one if missing
+        if current_render_future is None:
+            current_pdf_bytes = current_pdf_bytes or get_pdf_content(db, paper_id)
+            if current_pdf_bytes:
+                current_render_future = schedule_render(paper_id, current_pdf_bytes)
+
+        # If still no render job, skip but prefetch the next paper to keep pipeline moving
+        if current_render_future is None:
+            next_pdf_bytes = None
+            next_render_future = None
+            if i < len(paper_ids):
+                next_id = paper_ids[i]
+                next_pdf_bytes = get_pdf_content(db, next_id)
+                if next_pdf_bytes:
+                    next_render_future = schedule_render(next_id, next_pdf_bytes)
+                else:
+                    print(f"  (prefetch) No PDF content in database for {next_id}")
+
+            print("  No PDF content in database, skipping")
             fail_count += 1
+            current_pdf_bytes = next_pdf_bytes
+            current_render_future = next_render_future
             continue
+
+        # Wait for render to finish
+        render_data = current_render_future.result()
+
+        # Prefetch next PDF render while GPU works on this one
+        next_pdf_bytes = None
+        next_render_future = None
+        if i < len(paper_ids):
+            next_id = paper_ids[i]
+            next_pdf_bytes = get_pdf_content(db, next_id)
+            if next_pdf_bytes:
+                next_render_future = schedule_render(next_id, next_pdf_bytes)
+            else:
+                print(f"  (prefetch) No PDF content in database for {next_id}")
+
+        if not render_data.get("ok"):
+            error_msg = render_data.get("error", "rendering failed")
+            print(f"  Render error: {error_msg}")
+            save_ocr_results(db, paper_id, {}, error=error_msg)
+            fail_count += 1
+            current_pdf_bytes = next_pdf_bytes
+            current_render_future = next_render_future
+            continue
+
+        print(
+            f"  Prepared {render_data['target_pages']}/{render_data['total_pages']} page(s) at {render_data['render_dpi']} DPI"
+        )
+        if render_data.get("capped"):
+            print(f"  Note: capped pages due to render-page-limit={args.render_page_limit}")
 
         success = process_pdf_to_db(
             db=db,
             paper_id=paper_id,
-            pdf_bytes=pdf_bytes,
+            pdf_bytes=current_pdf_bytes or b"",
             service_url=args.service_url,
             max_pages=args.pages,
             gpu_workers=gpu_workers,
+            page_images=render_data["page_images"],
+            total_pages=render_data["total_pages"],
+            target_pages=render_data["target_pages"],
+            render_dpi=render_data["render_dpi"],
+            render_page_limit=args.render_page_limit,
         )
 
         if success:
             success_count += 1
         else:
             fail_count += 1
+
+        # Move pipeline forward
+        current_pdf_bytes = next_pdf_bytes
+        current_render_future = next_render_future
+
+    render_executor.shutdown(wait=True)
 
     print(f"\n{'='*50}")
     print(f"Done: {success_count} succeeded, {fail_count} failed")
