@@ -247,22 +247,33 @@ def process_pdf_to_db(
                     processed += 1
                     print(f"  Page {pg + 1}/{total_pages}: OK ({processed}/{len(pages_to_process)})")
 
+                    # Save incrementally (without completed flag) for resume support
+                    save_ocr_results(db, paper_id, _build_results(results_dict, total_pages))
+
             except Exception as e:
                 errors.append(f"page {page_num}: exception {e}")
                 print(f"  Page {page_num + 1}/{total_pages}: EXCEPTION - {e}")
 
-        # Save results after all pages complete
-        if errors:
-            error_msg = "; ".join(errors[:3])  # First 3 errors
-            if len(errors) > 3:
-                error_msg += f" (+{len(errors) - 3} more)"
-            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), error=error_msg)
-            print(f"  Completed with {len(errors)} error(s)")
-            return False
-        else:
-            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), completed=True)
-            print(f"  Completed successfully")
-            return True
+    # Final save: set completed=True only if ALL pages done and no errors
+    target_pages = min(total_pages, max_pages) if max_pages else total_pages
+    all_done = len(completed_pages) >= target_pages
+
+    if errors:
+        error_msg = "; ".join(errors[:3])
+        if len(errors) > 3:
+            error_msg += f" (+{len(errors) - 3} more)"
+        save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), error=error_msg)
+        print(f"  Completed with {len(errors)} error(s)")
+        return False
+    elif all_done:
+        save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), completed=True)
+        print(f"  Completed successfully")
+        return True
+    else:
+        # Partial completion (shouldn't happen normally, but safety check)
+        save_ocr_results(db, paper_id, _build_results(results_dict, total_pages))
+        print(f"  Partial: {len(completed_pages)}/{target_pages} pages")
+        return False
 
 
 def _build_results(results_dict: dict, total_pages: int = None) -> dict:
