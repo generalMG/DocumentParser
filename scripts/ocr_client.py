@@ -9,7 +9,6 @@ OCR client that fetches PDFs from database and stores results back to database.
 """
 
 import argparse
-import io
 import os
 import sys
 from datetime import datetime
@@ -26,13 +25,31 @@ from database.models import ArxivPaper  # noqa: E402
 load_dotenv(override=True)
 
 
-def fetch_papers_for_ocr(db: DatabaseManager, limit: int, offset: int) -> List[str]:
-    """Fetch paper IDs that have PDF content but haven't been OCR processed."""
+def fetch_papers_for_ocr(
+    db: DatabaseManager,
+    limit: int,
+    offset: int,
+    retry_errors: bool = False
+) -> List[str]:
+    """Fetch paper IDs that have PDF content but haven't been OCR processed.
+
+    Args:
+        db: Database manager
+        limit: Max papers to fetch
+        offset: Offset for pagination
+        retry_errors: If True, also include papers with ocr_error set (to retry failed ones)
+    """
     with db.session_scope() as session:
         query = session.query(ArxivPaper.id).filter(
             ArxivPaper.pdf_content.isnot(None),
             ArxivPaper.ocr_processed.is_(False),
-        ).order_by(ArxivPaper.id)
+        )
+
+        # Optionally exclude papers with errors (they failed previously)
+        if not retry_errors:
+            query = query.filter(ArxivPaper.ocr_error.is_(None))
+
+        query = query.order_by(ArxivPaper.id)
 
         if offset:
             query = query.offset(offset)
@@ -65,7 +82,8 @@ def save_ocr_results(
     paper_id: str,
     results: dict,
     completed: bool = False,
-    error: str = None
+    error: str = None,
+    clear_error: bool = False
 ):
     """Save OCR results to database."""
     with db.session_scope() as session:
@@ -75,9 +93,30 @@ def save_ocr_results(
             if completed:
                 paper.ocr_processed = True
                 paper.ocr_processed_at = datetime.utcnow()
-            if error:
+                paper.ocr_error = None  # Clear error on success
+            elif error:
                 paper.ocr_error = error
+            elif clear_error:
+                paper.ocr_error = None
             session.commit()
+
+
+def _extract_page_index(result: dict, fallback_index: int) -> int:
+    """Extract page index from OCR result, handling both 'page_index' (string) and 'page' (int)."""
+    # OCR service stores as 'page_index' (string)
+    if "page_index" in result:
+        try:
+            return int(result["page_index"])
+        except (ValueError, TypeError):
+            pass
+    # Fallback to 'page' field
+    if "page" in result:
+        try:
+            return int(result["page"])
+        except (ValueError, TypeError):
+            pass
+    # Use fallback index
+    return fallback_index
 
 
 def process_pdf_to_db(
@@ -95,13 +134,17 @@ def process_pdf_to_db(
     completed_pages = set()
     total_pages = existing_data.get("total_pages")
 
+    # Restore previously processed pages
     if existing_data.get("results"):
         for i, r in enumerate(existing_data["results"]):
-            page_num = r.get("page", i)
+            page_num = _extract_page_index(r, i)
             results_dict[page_num] = r
             completed_pages.add(page_num)
         if completed_pages:
-            print(f"{paper_id}: resuming from checkpoint (completed: {len(completed_pages)} pages)")
+            next_page = max(completed_pages) + 1
+            print(f"{paper_id}: resuming from page {next_page} (already completed: {len(completed_pages)} pages)")
+            # Clear any previous error since we're resuming
+            save_ocr_results(db, paper_id, existing_data, clear_error=True)
 
     page_num = 0
     while True:
@@ -193,6 +236,7 @@ def main():
     parser.add_argument("--pages", type=int, default=None, help="Max pages per PDF (default: all)")
     parser.add_argument("--limit", type=int, default=10, help="Max number of PDFs to process")
     parser.add_argument("--offset", type=int, default=0, help="Offset for DB query")
+    parser.add_argument("--retry-errors", action="store_true", help="Retry papers that previously failed with errors")
     parser.add_argument("--db-url", default=os.getenv("SQLALCHEMY_URL"), help="Optional DB URL override")
     parser.add_argument("--db-host", default=os.getenv("DB_HOST", ""), help="DB host")
     parser.add_argument("--db-port", type=int, default=int(os.getenv("DB_PORT", "5432")), help="DB port")
@@ -211,8 +255,15 @@ def main():
     )
     db.create_engine_and_session()
 
-    paper_ids = fetch_papers_for_ocr(db, limit=args.limit, offset=args.offset)
+    paper_ids = fetch_papers_for_ocr(
+        db,
+        limit=args.limit,
+        offset=args.offset,
+        retry_errors=args.retry_errors
+    )
     print(f"Found {len(paper_ids)} PDFs to process")
+    if args.retry_errors:
+        print("(including papers with previous errors)")
 
     success_count = 0
     fail_count = 0
