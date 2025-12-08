@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Client script to fetch PDFs from the database and send them to the OCR service.
+OCR client that fetches PDFs from database and stores results back to database.
 
-- Pulls rows with pdf_downloaded = true.
-- Sends each PDF to the FastAPI OCR service.
-- Saves JSON responses to an output directory.
+- Pulls papers with pdf_content (PDF stored in DB) that haven't been OCR processed yet
+- Sends each PDF to the FastAPI OCR service
+- Saves OCR results directly to the database (ocr_results JSONB column)
+- Tracks processing status via ocr_processed, ocr_processed_at, ocr_error columns
 """
 
 import argparse
-import json
+import io
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional
 
 import requests
 from dotenv import load_dotenv
@@ -24,94 +26,127 @@ from database.models import ArxivPaper  # noqa: E402
 load_dotenv(override=True)
 
 
-def fetch_pdfs(db: DatabaseManager, limit: int, offset: int) -> List[Tuple[str, str]]:
+def fetch_papers_for_ocr(db: DatabaseManager, limit: int, offset: int) -> List[str]:
+    """Fetch paper IDs that have PDF content but haven't been OCR processed."""
     with db.session_scope() as session:
-        query = session.query(ArxivPaper).filter(
-            ArxivPaper.pdf_downloaded.is_(True),
-            ArxivPaper.pdf_path.isnot(None),
+        query = session.query(ArxivPaper.id).filter(
+            ArxivPaper.pdf_content.isnot(None),
+            ArxivPaper.ocr_processed.is_(False),
         ).order_by(ArxivPaper.id)
+
         if offset:
             query = query.offset(offset)
         if limit:
             query = query.limit(limit)
-        rows = query.all()
-        return [(row.id, row.pdf_path) for row in rows if row.pdf_path]
+
+        return [row.id for row in query.all()]
 
 
-def process_pdf_incrementally(
+def get_pdf_content(db: DatabaseManager, paper_id: str) -> Optional[bytes]:
+    """Fetch PDF binary content from database."""
+    with db.session_scope() as session:
+        paper = session.query(ArxivPaper).filter(ArxivPaper.id == paper_id).first()
+        if paper and paper.pdf_content:
+            return paper.pdf_content
+        return None
+
+
+def get_partial_results(db: DatabaseManager, paper_id: str) -> dict:
+    """Get existing partial OCR results for resume support."""
+    with db.session_scope() as session:
+        paper = session.query(ArxivPaper).filter(ArxivPaper.id == paper_id).first()
+        if paper and paper.ocr_results:
+            return paper.ocr_results
+        return {}
+
+
+def save_ocr_results(
+    db: DatabaseManager,
     paper_id: str,
-    pdf_file: Path,
+    results: dict,
+    completed: bool = False,
+    error: str = None
+):
+    """Save OCR results to database."""
+    with db.session_scope() as session:
+        paper = session.query(ArxivPaper).filter(ArxivPaper.id == paper_id).first()
+        if paper:
+            paper.ocr_results = results
+            if completed:
+                paper.ocr_processed = True
+                paper.ocr_processed_at = datetime.utcnow()
+            if error:
+                paper.ocr_error = error
+            session.commit()
+
+
+def process_pdf_to_db(
+    db: DatabaseManager,
+    paper_id: str,
+    pdf_bytes: bytes,
     service_url: str,
-    output_dir: Path,
     max_pages: int = None,
 ) -> bool:
-    """Process a single PDF page by page with checkpoint support."""
-    checkpoint_path = output_dir / f"{paper_id}.checkpoint"
-    out_path = output_dir / f"{paper_id}.json"
+    """Process a single PDF page by page and save results to database."""
 
-    # Load checkpoint if exists
-    completed_pages = set()
+    # Load existing partial results for resume support
+    existing_data = get_partial_results(db, paper_id)
     results_dict = {}
-    total_pages = None
+    completed_pages = set()
+    total_pages = existing_data.get("total_pages")
 
-    if checkpoint_path.exists():
-        try:
-            with checkpoint_path.open("r") as f:
-                checkpoint = json.load(f)
-                completed_pages = set(checkpoint.get("completed_pages", []))
-                total_pages = checkpoint.get("total_pages")
-                print(f"{paper_id}: resuming from checkpoint (completed: {len(completed_pages)} pages)")
-        except Exception as e:
-            print(f"{paper_id}: failed to load checkpoint: {e}, starting fresh")
+    if existing_data.get("results"):
+        for i, r in enumerate(existing_data["results"]):
+            page_num = r.get("page", i)
+            results_dict[page_num] = r
+            completed_pages.add(page_num)
+        if completed_pages:
+            print(f"{paper_id}: resuming from checkpoint (completed: {len(completed_pages)} pages)")
 
-    # Load existing results if available
-    if out_path.exists():
-        try:
-            with out_path.open("r") as f:
-                existing_data = json.load(f)
-                results_dict = {r.get("page", i): r for i, r in enumerate(existing_data.get("results", []))}
-        except Exception as e:
-            print(f"{paper_id}: failed to load existing results: {e}")
-
-    # Read PDF file once
-    try:
-        with pdf_file.open("rb") as f:
-            pdf_bytes = f.read()
-    except Exception as e:
-        print(f"{paper_id}: failed to read PDF: {e}")
-        return False
-
-    # Determine total pages (from checkpoint or first request)
     page_num = 0
-    while total_pages is None or (max_pages and page_num < max_pages) or (not max_pages and page_num < total_pages):
+    while True:
+        # Skip already completed pages
         if page_num in completed_pages:
             page_num += 1
+            # Check termination conditions
+            if max_pages and page_num >= max_pages:
+                break
+            if total_pages and page_num >= total_pages:
+                break
             continue
 
-        # Request single page
+        # Send request to OCR service
         try:
-            files = {"file": (pdf_file.name, pdf_bytes, "application/pdf")}
+            files = {"file": (f"{paper_id}.pdf", pdf_bytes, "application/pdf")}
             data = {"page": page_num}
             resp = requests.post(service_url, files=files, data=data, timeout=6000)
         except Exception as e:
-            print(f"{paper_id}: page {page_num} request failed: {e}")
+            error_msg = f"page {page_num} request failed: {e}"
+            print(f"{paper_id}: {error_msg}")
+            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), error=error_msg)
             return False
 
         if resp.status_code != 200:
-            print(f"{paper_id}: page {page_num} service error {resp.status_code} -> {resp.text}")
+            error_msg = f"page {page_num} service error {resp.status_code}: {resp.text}"
+            print(f"{paper_id}: {error_msg}")
+            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), error=error_msg)
             return False
 
         try:
             payload = resp.json()
         except Exception as e:
-            print(f"{paper_id}: page {page_num} failed to parse JSON: {e}")
+            error_msg = f"page {page_num} failed to parse JSON: {e}"
+            print(f"{paper_id}: {error_msg}")
+            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), error=error_msg)
             return False
 
         # Extract total pages from first response
         if total_pages is None:
             total_pages = payload.get("total_pages")
             if total_pages is None:
-                print(f"{paper_id}: could not determine total pages")
+                error_msg = "could not determine total pages"
+                print(f"{paper_id}: {error_msg}")
+                save_ocr_results(db, paper_id, {}, error=error_msg)
                 return False
             print(f"{paper_id}: total pages = {total_pages}")
 
@@ -121,52 +156,42 @@ def process_pdf_incrementally(
             results_dict[page_num] = page_result
             completed_pages.add(page_num)
 
-            # Save incrementally
-            sorted_results = [results_dict[i] for i in sorted(results_dict.keys())]
-            try:
-                with out_path.open("w", encoding="utf-8") as out_f:
-                    json.dump({"results": sorted_results}, out_f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                print(f"{paper_id}: failed to save results: {e}")
-                return False
-
-            # Update checkpoint
-            try:
-                with checkpoint_path.open("w", encoding="utf-8") as ckpt_f:
-                    json.dump({
-                        "completed_pages": sorted(list(completed_pages)),
-                        "total_pages": total_pages,
-                    }, ckpt_f, indent=2)
-            except Exception as e:
-                print(f"{paper_id}: failed to save checkpoint: {e}")
-
-            print(f"{paper_id}: page {page_num}/{total_pages} completed")
+            # Save incrementally to database
+            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages))
+            print(f"{paper_id}: page {page_num + 1}/{total_pages} completed")
 
         page_num += 1
 
-        # Check if we've processed enough pages
+        # Check termination conditions
         if max_pages and page_num >= max_pages:
             break
         if page_num >= total_pages:
             break
 
-    # Clean up checkpoint when done
-    if len(completed_pages) >= total_pages or (max_pages and len(completed_pages) >= max_pages):
-        try:
-            checkpoint_path.unlink(missing_ok=True)
-            print(f"{paper_id}: processing complete, checkpoint removed")
-        except Exception as e:
-            print(f"{paper_id}: failed to remove checkpoint: {e}")
+    # Mark as completed
+    is_complete = len(completed_pages) >= total_pages or (max_pages and len(completed_pages) >= max_pages)
+    if is_complete:
+        save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), completed=True)
+        print(f"{paper_id}: processing complete")
 
     return True
 
 
+def _build_results(results_dict: dict, total_pages: int = None) -> dict:
+    """Build the results JSON structure."""
+    sorted_results = [results_dict[i] for i in sorted(results_dict.keys())]
+    output = {"results": sorted_results}
+    if total_pages:
+        output["total_pages"] = total_pages
+    output["processed_pages"] = len(sorted_results)
+    return output
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Send downloaded PDFs to OCR service")
+    parser = argparse.ArgumentParser(description="Process PDFs from database through OCR service")
     parser.add_argument("--service-url", default="http://localhost:8000/ocr_page", help="OCR service endpoint")
-    parser.add_argument("--output-dir", default="outputs/ocr_results", help="Directory to save JSON outputs")
-    parser.add_argument("--pages", type=int, default=None, help="Number of pages to process (default: all)")
-    parser.add_argument("--limit", type=int, default=10, help="Max number of PDFs to send")
+    parser.add_argument("--pages", type=int, default=None, help="Max pages per PDF (default: all)")
+    parser.add_argument("--limit", type=int, default=10, help="Max number of PDFs to process")
     parser.add_argument("--offset", type=int, default=0, help="Offset for DB query")
     parser.add_argument("--db-url", default=os.getenv("SQLALCHEMY_URL"), help="Optional DB URL override")
     parser.add_argument("--db-host", default=os.getenv("DB_HOST", ""), help="DB host")
@@ -175,9 +200,6 @@ def main():
     parser.add_argument("--db-user", default=os.getenv("DB_USER", "postgres"), help="DB user")
     parser.add_argument("--db-password", default=os.getenv("DB_PASSWORD", ""), help="DB password")
     args = parser.parse_args()
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     db = DatabaseManager(
         db_url=args.db_url,
@@ -189,27 +211,39 @@ def main():
     )
     db.create_engine_and_session()
 
-    rows = fetch_pdfs(db, limit=args.limit, offset=args.offset)
-    print(f"Found {len(rows)} PDFs to process")
+    paper_ids = fetch_papers_for_ocr(db, limit=args.limit, offset=args.offset)
+    print(f"Found {len(paper_ids)} PDFs to process")
 
-    for paper_id, pdf_path in rows:
-        pdf_file = Path(pdf_path)
-        if not pdf_file.exists():
-            print(f"Skipping missing file: {pdf_path}")
+    success_count = 0
+    fail_count = 0
+
+    for paper_id in paper_ids:
+        print(f"\n{'='*50}")
+        print(f"Processing: {paper_id}")
+        print('='*50)
+
+        pdf_bytes = get_pdf_content(db, paper_id)
+        if not pdf_bytes:
+            print(f"{paper_id}: no PDF content in database, skipping")
+            fail_count += 1
             continue
 
-        success = process_pdf_incrementally(
+        success = process_pdf_to_db(
+            db=db,
             paper_id=paper_id,
-            pdf_file=pdf_file,
+            pdf_bytes=pdf_bytes,
             service_url=args.service_url,
-            output_dir=output_dir,
             max_pages=args.pages,
         )
 
         if success:
-            print(f"{paper_id}: successfully processed")
+            success_count += 1
         else:
-            print(f"{paper_id}: processing failed")
+            fail_count += 1
+
+    print(f"\n{'='*50}")
+    print(f"Processing complete: {success_count} succeeded, {fail_count} failed")
+    print('='*50)
 
 
 if __name__ == "__main__":

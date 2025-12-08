@@ -9,6 +9,7 @@ FastAPI service that hosts PaddleOCR-VL and processes uploaded PDFs.
 
 import argparse
 import asyncio
+import gc
 import os
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
