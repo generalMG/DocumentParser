@@ -550,6 +550,7 @@ def _process_pdf_page(pdf_bytes: bytes, page_num: int, device: str, model_dir: s
             result = _to_serializable(results[0])
             if isinstance(result, dict):
                 result['dpi'] = target_dpi
+                result['page_index'] = page_num  # Set correct page index
 
             return {"ok": True, "result": result, "total_pages": total_pages}
         else:
