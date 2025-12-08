@@ -57,6 +57,12 @@ class ArxivPaper(Base):
     pdf_download_attempted_at = Column(TIMESTAMP, nullable=True)
     pdf_download_error = Column(Text, nullable=True)
 
+    # OCR results storage
+    ocr_results = Column(JSONB, nullable=True)
+    ocr_processed = Column(Boolean, default=False, server_default='false')
+    ocr_processed_at = Column(TIMESTAMP, nullable=True)
+    ocr_error = Column(Text, nullable=True)
+
     # Metadata timestamps
     created_at = Column(TIMESTAMP, default=datetime.utcnow, server_default=func.now())
     updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow, server_default=func.now())
