@@ -202,8 +202,9 @@ def process_pdf_to_db(
         if result is not None:
             results_dict[0] = result
             completed_pages.add(0)
-
-        print(f"  Total pages: {total_pages}")
+            print(f"  Total pages: {total_pages} (page 1 done)")
+        else:
+            print(f"  Total pages: {total_pages}")
 
     # Determine which pages still need processing
     target_pages = min(total_pages, max_pages) if max_pages else total_pages
