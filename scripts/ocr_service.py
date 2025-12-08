@@ -345,8 +345,29 @@ def _parse_parsing_res(parsing_res_item) -> dict:
         return {}
 
 
+def _bbox_iou(bbox1: list, bbox2: list) -> float:
+    """Calculate Intersection over Union (IoU) between two bboxes [x1, y1, x2, y2]."""
+    try:
+        x1 = max(bbox1[0], bbox2[0])
+        y1 = max(bbox1[1], bbox2[1])
+        x2 = min(bbox1[2], bbox2[2])
+        y2 = min(bbox1[3], bbox2[3])
+
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
+        area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0.0
+    except (IndexError, TypeError):
+        return 0.0
+
+
 def _enrich_results(results: Any) -> Any:
-    """Enrich layout_det_res boxes with content from parsing_res_list."""
+    """Enrich layout_det_res boxes with content from parsing_res_list by matching bounding boxes."""
     if not isinstance(results, list):
         return results
 
@@ -364,11 +385,31 @@ def _enrich_results(results: Any) -> Any:
         layout_det_res = page_result.get('layout_det_res', {})
         boxes = layout_det_res.get('boxes', [])
 
-        # Match by index (they should correspond 1:1)
-        for i, box in enumerate(boxes):
-            if i < len(parsed_items) and parsed_items[i]:
-                # Add content to box
-                box['content'] = parsed_items[i].get('content', '')
+        # Match boxes to parsed items by bounding box IoU
+        for box in boxes:
+            box_coord = box.get('coordinate', [])
+            if len(box_coord) < 4:
+                continue
+
+            best_match = None
+            best_iou = 0.0
+
+            for parsed in parsed_items:
+                parsed_bbox = parsed.get('bbox', [])
+                if len(parsed_bbox) < 4:
+                    continue
+
+                iou = _bbox_iou(box_coord, parsed_bbox)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_match = parsed
+
+            # Require reasonable overlap (IoU > 0.5) to match
+            if best_match and best_iou > 0.5:
+                box['content'] = best_match.get('content', '')
+            elif best_match and best_iou > 0.1:
+                # Lower threshold fallback - still assign if some overlap
+                box['content'] = best_match.get('content', '')
 
         enriched.append(page_result)
 
