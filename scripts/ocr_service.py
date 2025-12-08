@@ -375,6 +375,19 @@ def _enrich_results(results: Any) -> Any:
     return enriched
 
 
+def _cleanup_gpu_memory():
+    """Clean up GPU memory and trigger garbage collection."""
+    try:
+        import paddle
+        if paddle.device.is_compiled_with_cuda():
+            paddle.device.cuda.empty_cache()
+    except Exception as e:
+        logger.debug(f"GPU cache clear failed: {e}")
+
+    # Force garbage collection
+    gc.collect()
+
+
 def _process_pdf(pdf_bytes: bytes, pages: int, device: str, model_dir: str) -> dict:
     """Worker: run predict on PDF. Model must be pre-loaded. Returns dict to avoid pickling errors."""
     global _MODEL
@@ -385,17 +398,18 @@ def _process_pdf(pdf_bytes: bytes, pages: int, device: str, model_dir: str) -> d
         if not init_result["ok"]:
             return init_result
 
+    images = None
     try:
         from pdf2image import convert_from_bytes
-        
+
         # Convert PDF to images at fixed DPI
         # This ensures consistent coordinates regardless of PDF dimensions
         target_dpi = 200
         images = convert_from_bytes(pdf_bytes, dpi=target_dpi)
-        
+
         if pages and pages > 0:
             images = images[:pages]
-            
+
         results = []
         for i, img in enumerate(images):
             # Save to temp file for PaddleOCR (it expects file path or numpy array)
@@ -403,20 +417,23 @@ def _process_pdf(pdf_bytes: bytes, pages: int, device: str, model_dir: str) -> d
             with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp_img:
                 img.save(tmp_img.name)
                 page_result = _MODEL.predict(tmp_img.name)
-                
+
                 # If result is a list (multi-page), take the first item since we process one by one
                 if isinstance(page_result, list) and len(page_result) > 0:
                     page_result = page_result[0]
-                    
+
                 # Add page index
                 if isinstance(page_result, dict):
                     page_result['page_index'] = str(i)
-                    
+
                 results.append(page_result)
+
+            # Close PIL image after processing each page
+            img.close()
 
         # Enrich results with content in layout boxes
         results = _enrich_results(results)
-        
+
         # Inject DPI info into results
         serializable_results = _to_serializable(results)
         if isinstance(serializable_results, list):
@@ -427,6 +444,18 @@ def _process_pdf(pdf_bytes: bytes, pages: int, device: str, model_dir: str) -> d
         return {"ok": True, "results": serializable_results}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+    finally:
+        # Clean up PIL images
+        if images:
+            for img in images:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+            del images
+
+        # Clean up GPU memory
+        _cleanup_gpu_memory()
 
 
 def _process_pdf_page(pdf_bytes: bytes, page_num: int, device: str, model_dir: str) -> dict:
@@ -439,25 +468,34 @@ def _process_pdf_page(pdf_bytes: bytes, page_num: int, device: str, model_dir: s
         if not init_result["ok"]:
             return init_result
 
+    images = None
+    image = None
+    pdf_reader = None
     try:
         from pdf2image import convert_from_bytes
-        
+        from PyPDF2 import PdfReader
+        from io import BytesIO
+
+        # Get total pages first (before heavy image conversion)
+        pdf_reader = PdfReader(BytesIO(pdf_bytes))
+        total_pages = len(pdf_reader.pages)
+
         # Convert specific page to image at fixed DPI
         target_dpi = 200
-        
+
         # pdf2image uses 1-based indexing for first_page/last_page
         images = convert_from_bytes(
-            pdf_bytes, 
+            pdf_bytes,
             dpi=target_dpi,
-            first_page=page_num + 1, 
+            first_page=page_num + 1,
             last_page=page_num + 1
         )
-        
+
         if not images:
             return {"ok": False, "error": f"Page {page_num} could not be rendered"}
-            
+
         image = images[0]
-        
+
         # Process the single page image
         with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
             image.save(tmp.name)
@@ -471,14 +509,7 @@ def _process_pdf_page(pdf_bytes: bytes, page_num: int, device: str, model_dir: s
             result = _to_serializable(results[0])
             if isinstance(result, dict):
                 result['dpi'] = target_dpi
-            
-            # We need total pages count. pdf2image doesn't give it easily without reading the whole file.
-            # So we use PyPDF2 just for the count.
-            from PyPDF2 import PdfReader
-            from io import BytesIO
-            pdf_reader = PdfReader(BytesIO(pdf_bytes))
-            total_pages = len(pdf_reader.pages)
-            
+
             return {"ok": True, "result": result, "total_pages": total_pages}
         else:
             return {"ok": False, "error": "Unexpected results format from single page"}
@@ -486,6 +517,34 @@ def _process_pdf_page(pdf_bytes: bytes, page_num: int, device: str, model_dir: s
         import traceback
         error_trace = traceback.format_exc()
         return {"ok": False, "error": f"{str(e)}\n{error_trace}"}
+    finally:
+        # Clean up PIL image
+        if image:
+            try:
+                image.close()
+            except Exception:
+                pass
+            del image
+
+        # Clean up images list
+        if images:
+            for img in images:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+            del images
+
+        # Clean up PDF reader
+        if pdf_reader:
+            try:
+                pdf_reader.stream.close()
+            except Exception:
+                pass
+            del pdf_reader
+
+        # Clean up GPU memory after each page
+        _cleanup_gpu_memory()
 
 
 @app.on_event("startup")
