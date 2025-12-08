@@ -11,9 +11,10 @@ OCR client that fetches PDFs from database and stores results back to database.
 import argparse
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -23,6 +24,20 @@ from database.database import DatabaseManager  # noqa: E402
 from database.models import ArxivPaper  # noqa: E402
 
 load_dotenv(override=True)
+
+
+def get_service_info(service_url: str) -> dict:
+    """Query OCR service for configuration info including worker count."""
+    try:
+        # Convert /ocr_page URL to /info URL
+        base_url = service_url.rsplit('/', 1)[0]
+        info_url = f"{base_url}/info"
+        resp = requests.get(info_url, timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        print(f"Warning: Could not query service info: {e}")
+    return {}
 
 
 def fetch_papers_for_ocr(
@@ -230,12 +245,36 @@ def _build_results(results_dict: dict, total_pages: int = None) -> dict:
     return output
 
 
+def process_single_paper(
+    db: DatabaseManager,
+    paper_id: str,
+    service_url: str,
+    max_pages: int = None,
+) -> Tuple[str, bool]:
+    """Process a single paper. Returns (paper_id, success)."""
+    pdf_bytes = get_pdf_content(db, paper_id)
+    if not pdf_bytes:
+        print(f"{paper_id}: no PDF content in database, skipping")
+        return (paper_id, False)
+
+    success = process_pdf_to_db(
+        db=db,
+        paper_id=paper_id,
+        pdf_bytes=pdf_bytes,
+        service_url=service_url,
+        max_pages=max_pages,
+    )
+    return (paper_id, success)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Process PDFs from database through OCR service")
     parser.add_argument("--service-url", default="http://localhost:8000/ocr_page", help="OCR service endpoint")
     parser.add_argument("--pages", type=int, default=None, help="Max pages per PDF (default: all)")
     parser.add_argument("--limit", type=int, default=10, help="Max number of PDFs to process")
     parser.add_argument("--offset", type=int, default=0, help="Offset for DB query")
+    parser.add_argument("--gpu-workers", type=int, default=None,
+                        help="Number of concurrent papers to process (default: auto-detect from OCR service)")
     parser.add_argument("--retry-errors", action="store_true", help="Retry papers that previously failed with errors")
     parser.add_argument("--db-url", default=os.getenv("SQLALCHEMY_URL"), help="Optional DB URL override")
     parser.add_argument("--db-host", default=os.getenv("DB_HOST", ""), help="DB host")
@@ -244,6 +283,15 @@ def main():
     parser.add_argument("--db-user", default=os.getenv("DB_USER", "postgres"), help="DB user")
     parser.add_argument("--db-password", default=os.getenv("DB_PASSWORD", ""), help="DB password")
     args = parser.parse_args()
+
+    # Auto-detect GPU workers from OCR service if not specified
+    if args.gpu_workers is None:
+        service_info = get_service_info(args.service_url)
+        gpu_workers = service_info.get("workers", 1)
+        print(f"Auto-detected {gpu_workers} GPU worker(s) from OCR service")
+    else:
+        gpu_workers = args.gpu_workers
+        print(f"Using {gpu_workers} GPU worker(s) (user specified)")
 
     db = DatabaseManager(
         db_url=args.db_url,
@@ -265,36 +313,46 @@ def main():
     if args.retry_errors:
         print("(including papers with previous errors)")
 
+    if not paper_ids:
+        print("No papers to process.")
+        return
+
     success_count = 0
     fail_count = 0
 
-    for paper_id in paper_ids:
-        print(f"\n{'='*50}")
-        print(f"Processing: {paper_id}")
-        print('='*50)
+    # Process papers concurrently using ThreadPoolExecutor
+    print(f"\nProcessing {len(paper_ids)} papers with {gpu_workers} concurrent worker(s)...")
+    print("=" * 60)
 
-        pdf_bytes = get_pdf_content(db, paper_id)
-        if not pdf_bytes:
-            print(f"{paper_id}: no PDF content in database, skipping")
-            fail_count += 1
-            continue
+    with ThreadPoolExecutor(max_workers=gpu_workers) as executor:
+        # Submit all papers for processing
+        futures = {
+            executor.submit(
+                process_single_paper,
+                db,
+                paper_id,
+                args.service_url,
+                args.pages,
+            ): paper_id
+            for paper_id in paper_ids
+        }
 
-        success = process_pdf_to_db(
-            db=db,
-            paper_id=paper_id,
-            pdf_bytes=pdf_bytes,
-            service_url=args.service_url,
-            max_pages=args.pages,
-        )
+        # Process results as they complete
+        for future in as_completed(futures):
+            paper_id = futures[future]
+            try:
+                _, success = future.result()
+                if success:
+                    success_count += 1
+                else:
+                    fail_count += 1
+            except Exception as e:
+                print(f"{paper_id}: exception during processing: {e}")
+                fail_count += 1
 
-        if success:
-            success_count += 1
-        else:
-            fail_count += 1
-
-    print(f"\n{'='*50}")
+    print(f"\n{'='*60}")
     print(f"Processing complete: {success_count} succeeded, {fail_count} failed")
-    print('='*50)
+    print('='*60)
 
 
 if __name__ == "__main__":
