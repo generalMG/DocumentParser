@@ -25,7 +25,17 @@ from fastapi.responses import JSONResponse
 import uvicorn
 from dotenv import load_dotenv
 
+import time
+import uuid
+
 load_dotenv(override=True)
+
+# Shared objects (multiprocessing safe)
+MANAGER = None
+TASK_QUEUE = None
+RESULT_DICT = None
+MODEL_PROCESS = None
+
 
 # Configure logging
 logging.basicConfig(
@@ -109,8 +119,13 @@ except ImportError:
 
 app = FastAPI(title="PaddleOCR-VL Service")
 
-POOL: Optional[ProcessPoolExecutor] = None
+
+
 SERVICE_ARGS = None
+
+# Constants
+TIMEOUT_SECONDS = 120
+
 
 
 @app.exception_handler(Exception)
@@ -196,6 +211,77 @@ def _to_serializable(obj: Any):
         return "<unserializable>"
 
 
+def _run_model_server(device: str, model_dir: str, task_queue: mp.Queue, result_dict: dict):
+    """
+    Singleton process that holds the model and processes requests from the queue.
+    """
+    logger.info(f"Model Server starting on {device}...")
+    
+    # Initialize model
+    try:
+        if os.environ.get("OCR_MOCK_MODE"):
+            logger.info("Running in MOCK MODE - Skipping model load")
+            time.sleep(1) # Simulate load
+        else:
+            init_res = _init_model_worker(device, model_dir)
+            if not init_res["ok"]:
+                logger.error(f"Model Server initialization failed: {init_res.get('error')}")
+                return
+    except Exception as e:
+        logger.error(f"Model Server crashed during init: {e}")
+        return
+
+    logger.info("Model Server ready and listening for tasks.")
+    
+    while True:
+        try:
+            # Get task with a small timeout to allow checking for exit signals if needed (though we rely on daemon=True)
+            # block=True is default
+            task = task_queue.get() 
+            
+            if task is None:
+                # Sentinel to shutting down
+                logger.info("Model Server received shutdown signal.")
+                break
+                
+            req_id, func_name, args, kwargs = task
+            logger.debug(f"Processing task {req_id}: {func_name}")
+            
+            start_time = time.time()
+            try:
+                # Dispatch to appropriate function
+                if os.environ.get("OCR_MOCK_MODE"):
+                    time.sleep(0.1) # Simulate inference
+                    res = {"ok": True, "results": [{"page_index": "0", "content": "Mock OCR Result", "layout_det_res": {"boxes": []}, "dpi": 200}]}
+                    if func_name == "process_pdf_page":
+                         res = {"ok": True, "result": {"content": "Mock Page Result"}, "total_pages": 5}
+                elif func_name == "process_pdf":
+                    res = _process_pdf(*args, **kwargs)
+                elif func_name == "process_pdf_page":
+                    res = _process_pdf_page(*args, **kwargs)
+                elif func_name == "process_image_bytes":
+                    res = _process_image_bytes(*args, **kwargs)
+                else:
+                    res = {"ok": False, "error": f"Unknown function: {func_name}"}
+            except Exception as e:
+                logger.error(f"Error processing task {req_id}: {e}\n{traceback.format_exc()}")
+                res = {"ok": False, "error": str(e)}
+            
+            # Store result
+            # Note: In heavy load using a dict with thousands of keys might be slow, 
+            # but we remove keys immediately after retrieval.
+            result_dict[req_id] = res
+            logger.debug(f"Task {req_id} completed in {time.time() - start_time:.4f}s")
+            
+            # Periodic cleanup (optional, done in functions usually)
+            if device.startswith("gpu"):
+                _cleanup_gpu_memory()
+                
+        except Exception as e:
+            logger.error(f"Model Server loop error: {e}")
+            time.sleep(0.1)  # tiny backoff using time.sleep prevents busy loop if queue broken
+
+
 def _check_gpu_availability(device: str) -> dict:
     """Check GPU availability and memory."""
     try:
@@ -237,6 +323,8 @@ def _check_gpu_availability(device: str) -> dict:
     except Exception as e:
         return {"ok": False, "error": f"GPU check failed: {e}"}
 
+
+_MODEL = None # Global model instance for the model server process
 
 def _init_model_worker(device: str, model_dir: str) -> dict:
     """Initialize model in worker process and run warm-up."""
@@ -436,10 +524,12 @@ def _process_pdf(pdf_bytes: bytes, pages: int, device: str, model_dir: str) -> d
     global _MODEL
 
     # Initialize model if not already loaded (fallback for legacy code paths)
+    # In the new singleton model server, this is likely already loaded by the server init loop
     if "_MODEL" not in globals() or _MODEL is None:
         init_result = _init_model_worker(device, model_dir)
         if not init_result["ok"]:
             return init_result
+
 
     images = None
     try:
@@ -503,13 +593,15 @@ def _process_pdf(pdf_bytes: bytes, pages: int, device: str, model_dir: str) -> d
 
 def _process_pdf_page(pdf_bytes: bytes, page_num: int, device: str, model_dir: str) -> dict:
     """Worker: process a single page of a PDF. Model must be pre-loaded. Returns dict to avoid pickling errors."""
+    # Initialize model if not already loaded (fallback for legacy code paths or first run in process)
+    # In the new singleton model server, this is likely already loaded by the server init loop,
+    # but we keep this check for safety.
     global _MODEL
-
-    # Initialize model if not already loaded (fallback for legacy code paths)
     if "_MODEL" not in globals() or _MODEL is None:
         init_result = _init_model_worker(device, model_dir)
         if not init_result["ok"]:
             return init_result
+
 
     images = None
     image = None
@@ -610,12 +702,9 @@ def _process_image_bytes(
     model_dir: str
 ) -> dict:
     """Worker: process a pre-rendered image. Avoids re-rendering the PDF server-side."""
-    global _MODEL
+    # Remove lazy loading check since we are now in a dedicated process that ensures init
+    # checks are done before loop entry or during init
 
-    if "_MODEL" not in globals() or _MODEL is None:
-        init_result = _init_model_worker(device, model_dir)
-        if not init_result["ok"]:
-            return init_result
 
     image = None
     try:
@@ -661,58 +750,92 @@ def _process_image_bytes(
         _cleanup_gpu_memory()
 
 
+
+async def _submit_task(func_name: str, *args, **kwargs) -> dict:
+    """Submit a task to the model server and wait for the result."""
+    if not TASK_QUEUE:
+        raise HTTPException(status_code=503, detail="Model server not ready")
+        
+    req_id = str(uuid.uuid4())
+    
+    # Create the task payload
+    # Note: We are passing large bytes objects here (pdf_bytes, image_bytes).
+    # multiprocessing.Queue handles pickling, but for VERY large concurrency this might be a bottleneck.
+    # Given the VRAM limit, we won't have massive concurrency anyway.
+    task = (req_id, func_name, args, kwargs)
+    
+    try:
+        TASK_QUEUE.put(task)
+    except Exception as e:
+         raise HTTPException(status_code=500, detail=f"Failed to queue task: {e}")
+
+    # Polling for result (using asyncio.sleep to be non-blocking)
+    # A cleaner way would be using an asyncio.Event with a shared state, 
+    # but Manager dict is easiest for multi-process sharing without extra networking.
+    start_time = time.time()
+    while True:
+        if req_id in RESULT_DICT:
+            result = RESULT_DICT.pop(req_id)
+            return result
+        
+        if time.time() - start_time > TIMEOUT_SECONDS:
+            # Try to cleanup
+            RESULT_DICT.pop(req_id, None)
+            raise HTTPException(status_code=504, detail="Processing timed out")
+
+        await asyncio.sleep(0.05)
+
+
 @app.on_event("startup")
 async def _startup():
-    global POOL
+    global MANAGER, TASK_QUEUE, RESULT_DICT, MODEL_PROCESS
+    
     if SERVICE_ARGS is None:
         return
-    # fall back to threads if process pool creation fails (e.g., permission errors)
-    try:
-        ctx = mp.get_context("spawn")
-        POOL = ProcessPoolExecutor(max_workers=SERVICE_ARGS.workers, mp_context=ctx)
-    except Exception as e:
-        print(f"Process pool unavailable ({e}), falling back to ThreadPoolExecutor")
-        from concurrent.futures import ThreadPoolExecutor
-        POOL = ThreadPoolExecutor(max_workers=SERVICE_ARGS.workers)
+        
+    print(f"\nStarting Model Server on device={SERVICE_ARGS.device}...")
+    
+    # Start Manager
+    MANAGER = mp.Manager()
+    TASK_QUEUE = MANAGER.Queue()
+    RESULT_DICT = MANAGER.dict()
+    
+    # Start Model Process
+    # We use 'spawn' to ensure clean process start
+    ctx = mp.get_context("spawn")
+    MODEL_PROCESS = ctx.Process(
+        target=_run_model_server,
+        args=(SERVICE_ARGS.device, SERVICE_ARGS.model_dir, TASK_QUEUE, RESULT_DICT),
+        daemon=True
+    )
+    MODEL_PROCESS.start()
+    
+    print("Model Server process started.")
 
-    # Pre-initialize all workers with model loading and warm-up
-    print(f"\nInitializing {SERVICE_ARGS.workers} worker(s) with device={SERVICE_ARGS.device}...")
-    loop = asyncio.get_running_loop()
-    init_tasks = []
-    for i in range(SERVICE_ARGS.workers):
-        init_tasks.append(
-            loop.run_in_executor(
-                POOL, _init_model_worker, SERVICE_ARGS.device, SERVICE_ARGS.model_dir
-            )
-        )
 
-    # Wait for all workers to initialize
-    try:
-        results = await asyncio.gather(*init_tasks, return_exceptions=True)
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                print(f"Worker {i+1} initialization failed: {result}")
-                raise RuntimeError(f"Worker initialization failed: {result}")
-            elif not result.get("ok"):
-                print(f"Worker {i+1} initialization failed: {result.get('error')}")
-                raise RuntimeError(f"Worker initialization failed: {result.get('error')}")
-            else:
-                print(f"Worker {i+1} ready on {result.get('device')}")
-        print(f"\nAll {SERVICE_ARGS.workers} worker(s) initialized successfully!\n")
-    except Exception as e:
-        print(f"\nFATAL: Worker initialization failed: {e}")
-        if POOL:
-            POOL.shutdown(wait=False)
-            POOL = None
-        raise
 
 
 @app.on_event("shutdown")
 async def _shutdown():
-    global POOL
-    if POOL:
-        POOL.shutdown(wait=True)
-        POOL = None
+    global MODEL_PROCESS, MANAGER
+    if TASK_QUEUE:
+        try:
+            TASK_QUEUE.put(None)  # Sentinel
+        except:
+            pass
+            
+    if MODEL_PROCESS:
+        print("Waiting for Model Server to shut down...")
+        MODEL_PROCESS.join(timeout=5)
+        if MODEL_PROCESS.is_alive():
+            print("Force killing Model Server...")
+            MODEL_PROCESS.kill()
+            
+    if MANAGER:
+        MANAGER.shutdown()
+        
+    print("Shutdown complete.")
+
 
 
 @app.get("/health")
@@ -722,13 +845,13 @@ async def health():
 
 @app.get("/info")
 async def info():
-    """Return service configuration info including worker count."""
+    """Return service configuration info."""
     return {
         "status": "ok",
-        "workers": SERVICE_ARGS.workers if SERVICE_ARGS else 0,
         "device": SERVICE_ARGS.device if SERVICE_ARGS else "unknown",
-        "pool_ready": POOL is not None,
+        "model_server_alive": MODEL_PROCESS.is_alive() if MODEL_PROCESS else False,
     }
+
 
 
 @app.post("/ocr")
@@ -738,10 +861,6 @@ async def ocr_endpoint(
 ):
     logger.info(f"OCR request received: filename={file.filename}, pages={pages}")
 
-    if POOL is None:
-        logger.error("Worker pool not ready")
-        raise HTTPException(status_code=503, detail="Worker pool not ready")
-
     try:
         data = await file.read()
         logger.info(f"Read {len(data)} bytes from {file.filename}")
@@ -749,16 +868,23 @@ async def ocr_endpoint(
         logger.error(f"Failed to read file {file.filename}: {e}")
         raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
 
-    loop = asyncio.get_running_loop()
     try:
         logger.info(f"Submitting OCR task for {file.filename}")
-        result = await loop.run_in_executor(
-            POOL, _process_pdf, data, pages, SERVICE_ARGS.device, SERVICE_ARGS.model_dir
+        # Submit to queue
+        result = await _submit_task(
+            "process_pdf", 
+            pdf_bytes=data, 
+            pages=pages, 
+            device=SERVICE_ARGS.device, 
+            model_dir=SERVICE_ARGS.model_dir
         )
         logger.info(f"OCR task completed for {file.filename}")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"OCR execution failed for {file.filename}: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
+
 
     if not result.get("ok"):
         error_msg = result.get('error', 'Unknown error')
@@ -776,10 +902,6 @@ async def ocr_page_endpoint(
 ):
     logger.info(f"OCR page request received: filename={file.filename}, page={page}")
 
-    if POOL is None:
-        logger.error("Worker pool not ready")
-        raise HTTPException(status_code=503, detail="Worker pool not ready")
-
     try:
         data = await file.read()
         logger.info(f"Read {len(data)} bytes from {file.filename} for page {page}")
@@ -787,16 +909,23 @@ async def ocr_page_endpoint(
         logger.error(f"Failed to read file {file.filename}: {e}")
         raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
 
-    loop = asyncio.get_running_loop()
     try:
         logger.info(f"Submitting OCR page task for {file.filename} page {page}")
-        result = await loop.run_in_executor(
-            POOL, _process_pdf_page, data, page, SERVICE_ARGS.device, SERVICE_ARGS.model_dir
+        # Submit to queue
+        result = await _submit_task(
+            "process_pdf_page", 
+            pdf_bytes=data, 
+            page_num=page, 
+            device=SERVICE_ARGS.device, 
+            model_dir=SERVICE_ARGS.model_dir
         )
         logger.info(f"OCR page task completed for {file.filename} page {page}")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"OCR page execution failed for {file.filename} page {page}: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
+
 
     if not result.get("ok"):
         error_msg = result.get('error', 'Unknown error')
@@ -815,10 +944,6 @@ async def ocr_image_endpoint(
 ):
     logger.info(f"OCR image request received: filename={file.filename}, page={page}, dpi={dpi}")
 
-    if POOL is None:
-        logger.error("Worker pool not ready")
-        raise HTTPException(status_code=503, detail="Worker pool not ready")
-
     try:
         data = await file.read()
         logger.info(f"Read {len(data)} bytes from {file.filename} for page {page}")
@@ -826,16 +951,24 @@ async def ocr_image_endpoint(
         logger.error(f"Failed to read file {file.filename}: {e}")
         raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
 
-    loop = asyncio.get_running_loop()
     try:
         logger.info(f"Submitting OCR image task for {file.filename} page {page}")
-        result = await loop.run_in_executor(
-            POOL, _process_image_bytes, data, page, dpi, SERVICE_ARGS.device, SERVICE_ARGS.model_dir
+        # Submit to queue
+        result = await _submit_task(
+            "process_image_bytes", 
+            image_bytes=data, 
+            page_index=page, 
+            dpi=dpi, 
+            device=SERVICE_ARGS.device, 
+            model_dir=SERVICE_ARGS.model_dir
         )
         logger.info(f"OCR image task completed for {file.filename} page {page}")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"OCR image execution failed for {file.filename} page {page}: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
+
 
     if not result.get("ok"):
         error_msg = result.get('error', 'Unknown error')

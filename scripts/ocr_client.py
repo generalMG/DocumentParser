@@ -32,6 +32,7 @@ load_dotenv(override=True)
 
 DEFAULT_RENDER_DPI = 200
 RENDER_PAGE_LIMIT = 100
+DEFAULT_PAGE_BATCH_SIZE = 8
 
 
 def get_service_info(service_url: str) -> dict:
@@ -166,45 +167,52 @@ def _render_pdf_to_images(
     return rendered
 
 
+def _render_pdf_chunk(
+    pdf_bytes: bytes,
+    start_page: int,
+    end_page: int,
+    dpi: int = DEFAULT_RENDER_DPI
+) -> Dict[int, bytes]:
+    """Render a contiguous chunk of PDF pages [start_page, end_page] (0-based inclusive) to PNG bytes."""
+    images = convert_from_bytes(
+        pdf_bytes,
+        dpi=dpi,
+        first_page=start_page + 1,
+        last_page=end_page + 1,
+    )
+    rendered = {}
+    for idx, image in enumerate(images, start=start_page):
+        with BytesIO() as buf:
+            image.save(buf, format="PNG")
+            rendered[idx] = buf.getvalue()
+        image.close()
+    return rendered
+
+
 def _prepare_render_job(
     paper_id: str,
     pdf_bytes: bytes,
     max_pages: Optional[int],
-    render_page_limit: int,
     dpi: int,
 ) -> dict:
-    """Prepare a PDF for GPU processing by rendering pages to images. Runs in a thread."""
+    """Prepare a PDF for GPU processing by gathering metadata (page counts). Runs in a thread."""
     try:
         total_pages = _get_pdf_total_pages(pdf_bytes)
     except Exception as e:
         return {"ok": False, "error": f"could not determine total pages: {e}"}
 
+    # The "goal" target is everything, unless the user explicitly wants to partial-process via --pages
     target_pages = min(total_pages, max_pages) if max_pages else total_pages
-    if render_page_limit:
-        if target_pages > render_page_limit:
-            target_pages = render_page_limit
-            capped = True
-        else:
-            capped = False
-    else:
-        capped = False
 
     if target_pages <= 0:
         return {"ok": False, "error": "no pages to process after applying limits"}
 
-    try:
-        page_images = _render_pdf_to_images(pdf_bytes, target_pages, dpi=dpi)
-    except Exception as e:
-        return {"ok": False, "error": f"failed to render PDF to images: {e}"}
-
     return {
         "ok": True,
         "paper_id": paper_id,
-        "page_images": page_images,
         "total_pages": total_pages,
         "target_pages": target_pages,
         "render_dpi": dpi,
-        "capped": capped,
     }
 
 
@@ -246,11 +254,11 @@ def process_pdf_to_db(
     service_url: str,
     max_pages: int = None,
     gpu_workers: int = 1,
-    page_images: Optional[Dict[int, bytes]] = None,
     total_pages: Optional[int] = None,
     target_pages: Optional[int] = None,
     render_dpi: int = DEFAULT_RENDER_DPI,
     render_page_limit: int = RENDER_PAGE_LIMIT,
+    page_batch_size: int = DEFAULT_PAGE_BATCH_SIZE,
 ) -> bool:
     """Process a single PDF with concurrent page processing."""
 
@@ -287,14 +295,10 @@ def process_pdf_to_db(
         save_ocr_results(db, paper_id, {}, error=error_msg)
         return False
 
-    # Determine how many pages to process (respect render limit and CLI max_pages)
+    # Determine "goal" pages (what we ultimately want to finish)
     effective_target = target_pages
     if effective_target is None:
         effective_target = min(total_pages, max_pages) if max_pages else total_pages
-    if render_page_limit:
-        if effective_target > render_page_limit:
-            print(f"  Capping pages to {render_page_limit} to avoid OOM")
-            effective_target = render_page_limit
 
     if effective_target <= 0:
         error_msg = "no pages to process after applying limits"
@@ -302,91 +306,125 @@ def process_pdf_to_db(
         save_ocr_results(db, paper_id, {}, error=error_msg)
         return False
 
-    # Determine which pages still need processing
-    pages_to_process = [p for p in range(effective_target) if p not in completed_pages]
+    # Determine which pages need processing right now
+    # We filter out already completed pages
+    all_pages_needed = [p for p in range(effective_target) if p not in completed_pages]
 
-    if not pages_to_process:
+    if not all_pages_needed:
         print(f"  All pages already completed")
         save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), completed=True)
         return True
 
-    # Render pages client-side once to avoid re-sending the PDF for each page
-    if page_images is None:
-        try:
-            page_images = _render_pdf_to_images(pdf_bytes, effective_target, dpi=render_dpi)
-            print(f"  Rendered {len(page_images)} page(s) at {render_dpi} DPI")
-        except Exception as e:
-            error_msg = f"failed to render PDF to images: {e}"
-            print(f"  Error: {error_msg}")
-            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), error=error_msg)
-            return False
+    # APPLY BATCH LIMIT: Only take the first N needed pages for this run
+    if render_page_limit and len(all_pages_needed) > render_page_limit:
+        print(f"  Batching: processing next {render_page_limit} pages (of {len(all_pages_needed)} remaining)")
+        pages_to_process = all_pages_needed[:render_page_limit]
+        is_partial_run = True
+    else:
+        pages_to_process = all_pages_needed
+        is_partial_run = False
 
-    missing_images = [p for p in pages_to_process if p not in page_images]
-    if missing_images:
-        error_msg = f"rendered images missing for pages: {missing_images}"
-        print(f"  Error: {error_msg}")
-        save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), error=error_msg)
-        return False
+    print(
+        f"  Processing {len(pages_to_process)} pages with up to "
+        f"{min(gpu_workers, page_batch_size)} concurrent worker(s) per batch..."
+    )
 
-    print(f"  Processing {len(pages_to_process)} pages with {gpu_workers} concurrent worker(s)...")
+    processed = 0
+    errors = []
 
-    # Process pages concurrently
-    with ThreadPoolExecutor(max_workers=gpu_workers) as executor:
-        futures = {
-            executor.submit(
-                _process_single_image,
-                paper_id,
-                page_num,
-                page_images.get(page_num),
-                service_url,
-                render_dpi,
-            ): page_num
-            for page_num in pages_to_process
-        }
+    def iter_contiguous_runs(pages):
+        if not pages:
+            return
+        run = [pages[0]]
+        for p in pages[1:]:
+            if p == run[-1] + 1:
+                run.append(p)
+            else:
+                yield run
+                run = [p]
+        if run:
+            yield run
 
-        processed = 0
-        errors = []
+    # Process in contiguous batches to avoid re-rendering already completed pages
+    for run in iter_contiguous_runs(sorted(pages_to_process)):
+        for i in range(0, len(run), page_batch_size):
+            chunk = run[i : i + page_batch_size]
+            start_page, end_page = chunk[0], chunk[-1]
 
-        for future in as_completed(futures):
-            page_num = futures[future]
             try:
-                pg, result, error = future.result()
-
-                if error:
-                    errors.append(f"page {pg}: {error}")
-                    print(f"  Page {pg + 1}/{total_pages}: ERROR - {error}")
-                elif result is not None:
-                    results_dict[pg] = result
-                    completed_pages.add(pg)
-                    processed += 1
-                    print(f"  Page {pg + 1}/{total_pages}: OK ({processed}/{len(pages_to_process)})")
-
-                    # Save incrementally (without completed flag) for resume support
-                    save_ocr_results(db, paper_id, _build_results(results_dict, total_pages))
-
+                page_images = _render_pdf_chunk(pdf_bytes, start_page, end_page, dpi=render_dpi)
             except Exception as e:
-                errors.append(f"page {page_num}: exception {e}")
-                print(f"  Page {page_num + 1}/{total_pages}: EXCEPTION - {e}")
+                error_msg = f"failed to render pages {start_page}-{end_page}: {e}"
+                print(f"  Error: {error_msg}")
+                errors.append(error_msg)
+                continue
 
-    # Final save: set completed=True only if ALL pages done and no errors
-    all_done = len(completed_pages) >= effective_target
+            # Send chunk with limited concurrency
+            concurrency = min(gpu_workers, page_batch_size, len(chunk))
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = {
+                    executor.submit(
+                        _process_single_image,
+                        paper_id,
+                        page_num,
+                        page_images.get(page_num),
+                        service_url,
+                        render_dpi,
+                    ): page_num
+                    for page_num in chunk
+                }
+
+                for future in as_completed(futures):
+                    page_num = futures[future]
+                    try:
+                        pg, result, error = future.result()
+                        if error:
+                            errors.append(f"page {pg}: {error}")
+                            print(f"  Page {pg + 1}/{total_pages}: ERROR - {error}")
+                        elif result is not None:
+                            results_dict[pg] = result
+                            completed_pages.add(pg)
+                            processed += 1
+                            print(
+                                f"  Page {pg + 1}/{total_pages}: OK "
+                                f"({processed}/{len(pages_to_process)})"
+                            )
+
+                            # Save incrementally (without completed flag) for resume support
+                            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages))
+                    except Exception as e:
+                        errors.append(f"page {page_num}: exception {e}")
+                        print(f"  Page {page_num + 1}/{total_pages}: EXCEPTION - {e}")
+
+    # Final save logic
+    # We only mark completed=True if we have actually finished ALL pages for the target,
+    # AND there are no errors in this run (or previously if we tracked them, but mainly this run).
+    # If is_partial_run is True, we definitely aren't done.
+    
+    total_finished_now = len(completed_pages)
+    actually_all_done = total_finished_now >= effective_target
 
     if errors:
         error_msg = "; ".join(errors[:3])
         if len(errors) > 3:
             error_msg += f" (+{len(errors) - 3} more)"
         save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), error=error_msg)
-        print(f"  Completed with {len(errors)} error(s)")
+        print(f"  Run completed with {len(errors)} error(s)")
         return False
-    elif all_done:
+
+    elif actually_all_done:
         save_ocr_results(db, paper_id, _build_results(results_dict, total_pages), completed=True)
-        print(f"  Completed successfully")
+        print(f"  Completed successfully (all {total_finished_now} pages)")
         return True
+        
     else:
-        # Partial completion (shouldn't happen normally, but safety check)
+        # We finished this batch, but the PDF isn't fully done yet
         save_ocr_results(db, paper_id, _build_results(results_dict, total_pages))
-        print(f"  Partial: {len(completed_pages)}/{effective_target} pages")
-        return False
+        if is_partial_run:
+             print(f"  Batch complete: {processed} pages processed. Reschedule to finish remaining pages.")
+        else:
+             print(f"  Partial: {total_finished_now}/{effective_target} pages completed")
+        return True
 
 
 def _build_results(results_dict: dict, total_pages: int = None) -> dict:
@@ -414,6 +452,8 @@ def main():
     parser.add_argument("--retry-errors", action="store_true", help="Retry papers that previously failed with errors")
     parser.add_argument("--render-page-limit", type=int, default=RENDER_PAGE_LIMIT,
                         help="Max pages to render per PDF to avoid OOM (default: 100)")
+    parser.add_argument("--page-batch-size", type=int, default=DEFAULT_PAGE_BATCH_SIZE,
+                        help="Max pages to render/process per batch to reduce GPU/CPU spikes (default: 8)")
     parser.add_argument("--db-url", default=os.getenv("SQLALCHEMY_URL"), help="Optional DB URL override")
     parser.add_argument("--db-host", default=os.getenv("DB_HOST", ""), help="DB host")
     parser.add_argument("--db-port", type=int, default=int(os.getenv("DB_PORT", "5432")), help="DB port")
@@ -458,7 +498,7 @@ def main():
     success_count = 0
     fail_count = 0
 
-    # Pipeline: render next PDF while GPU processes current PDF pages
+    # Pipeline: precompute next PDF metadata while GPU processes current PDF pages
     render_executor = ThreadPoolExecutor(max_workers=2)
 
     def schedule_render(p_id: str, pdf_bytes: Optional[bytes]):
@@ -469,7 +509,6 @@ def main():
             p_id,
             pdf_bytes,
             args.pages,
-            args.render_page_limit,
             DEFAULT_RENDER_DPI,
         )
 
@@ -533,7 +572,7 @@ def main():
             continue
 
         print(
-            f"  Prepared {render_data['target_pages']}/{render_data['total_pages']} page(s) at {render_data['render_dpi']} DPI"
+            f"  Prepared metadata for {render_data['target_pages']}/{render_data['total_pages']} page(s) at {render_data['render_dpi']} DPI"
         )
         if render_data.get("capped"):
             print(f"  Note: capped pages due to render-page-limit={args.render_page_limit}")
@@ -545,11 +584,11 @@ def main():
             service_url=args.service_url,
             max_pages=args.pages,
             gpu_workers=gpu_workers,
-            page_images=render_data["page_images"],
             total_pages=render_data["total_pages"],
             target_pages=render_data["target_pages"],
             render_dpi=render_data["render_dpi"],
             render_page_limit=args.render_page_limit,
+            page_batch_size=args.page_batch_size,
         )
 
         if success:

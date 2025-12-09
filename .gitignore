@@ -46,3 +46,5 @@ test_safetensors.py
 test_safetensors_dtype.py
 test_torch_conversion.py
 debug_dpi*
+test_ocr_refactor.py
+*tests/*

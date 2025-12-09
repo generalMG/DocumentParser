@@ -210,6 +210,9 @@ python scripts/ocr_client.py --limit 100 --pages 10
 # Cap rendered pages to avoid OOM on huge PDFs (default 100)
 python scripts/ocr_client.py --limit 100 --render-page-limit 100
 
+# Throttle per-batch processing to reduce GPU/CPU spikes (default batch size 8)
+python scripts/ocr_client.py --limit 100 --page-batch-size 4 --gpu-workers 1
+
 # Override worker count
 python scripts/ocr_client.py --limit 100 --gpu-workers 2
 
@@ -220,7 +223,7 @@ python scripts/ocr_client.py --limit 100 --retry-errors
 ### Client features
 - **Database storage**: OCR results saved as JSONB directly in PostgreSQL (no local files)
 - **Client-side rendering**: Pre-renders PDF pages to images once, cutting bandwidth ~25x vs sending PDFs repeatedly
-- **CPU/GPU pipeline**: Renders the next PDF while GPU OCR runs on the current one (queue size 1) and caps rendering to 100 pages by default to avoid OOM
+- **CPU/GPU pipeline**: Prefetches next-PDF metadata while GPU OCR runs on the current one, caps rendering to 100 pages by default, and batches pages (default 8/page batch) to reduce GPU/CPU spikes
 - **Concurrent page processing**: Processes N pages simultaneously (auto-detects from service)
 - **Resume support**: Automatically resumes from last processed page if interrupted
 - **Progress tracking**: Clean per-paper logging with page progress
