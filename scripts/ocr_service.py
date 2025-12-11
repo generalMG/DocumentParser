@@ -124,7 +124,7 @@ app = FastAPI(title="PaddleOCR-VL Service")
 SERVICE_ARGS = None
 
 # Constants
-TIMEOUT_SECONDS = 120
+TIMEOUT_SECONDS = int(os.getenv("OCR_TIMEOUT_SECONDS", "3600"))
 
 
 
