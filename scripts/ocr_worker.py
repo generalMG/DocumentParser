@@ -544,23 +544,23 @@ def _build_results(results_map, total_pages):
 
 def main():
     parser = argparse.ArgumentParser(description="Unified OCR Worker")
-    parser.add_argument("--device", default="gpu:0", help="Paddle device")
-    parser.add_argument("--model-dir", default=os.path.expanduser("~/.paddlex/official_models"))
+    parser.add_argument("--device", default="gpu:0", help="Paddle device (e.g. gpu:0, cpu)")
+    parser.add_argument("--model-dir", default=os.path.expanduser("~/.paddlex/official_models"), help="Directory for PaddleOCR models")
     
-    parser.add_argument("--limit", type=int, default=10, help="Papers to process")
-    parser.add_argument("--pages", type=int, default=None, help="Max pages per paper")
-    parser.add_argument("--offset", type=int, default=0)
-    parser.add_argument("--retry-errors", action="store_true")
+    parser.add_argument("--limit", type=int, default=10, help="Max number of papers to process in this run")
+    parser.add_argument("--pages", type=int, default=None, help="Max pages to process per paper (default: all)")
+    parser.add_argument("--offset", type=int, default=0, help="Offset to skip N eligible papers (for sharding/debugging)")
+    parser.add_argument("--retry-errors", action="store_true", help="Retry papers that previously failed with errors")
     
-    parser.add_argument("--render-page-limit", type=int, default=RENDER_PAGE_LIMIT)
-    parser.add_argument("--page-batch-size", type=int, default=DEFAULT_PAGE_BATCH_SIZE)
+    parser.add_argument("--render-page-limit", type=int, default=RENDER_PAGE_LIMIT, help="Max pages to render per paper to avoid OOM on huge PDFs")
+    parser.add_argument("--page-batch-size", type=int, default=DEFAULT_PAGE_BATCH_SIZE, help="Number of pages to render/process in a single batch")
     
-    parser.add_argument("--db-url", default=os.getenv("SQLALCHEMY_URL"))
-    parser.add_argument("--db-host", default=os.getenv("DB_HOST", ""))
-    parser.add_argument("--db-port", type=int, default=int(os.getenv("DB_PORT", "5432")))
-    parser.add_argument("--db-name", default=os.getenv("DB_NAME", "arxiv"))
-    parser.add_argument("--db-user", default=os.getenv("DB_USER", "postgres"))
-    parser.add_argument("--db-password", default=os.getenv("DB_PASSWORD", ""))
+    parser.add_argument("--db-url", default=os.getenv("SQLALCHEMY_URL"), help="Full SQLAlchemy DB URL")
+    parser.add_argument("--db-host", default=os.getenv("DB_HOST", ""), help="DB Host")
+    parser.add_argument("--db-port", type=int, default=int(os.getenv("DB_PORT", "5432")), help="DB Port")
+    parser.add_argument("--db-name", default=os.getenv("DB_NAME", "arxiv"), help="DB Name")
+    parser.add_argument("--db-user", default=os.getenv("DB_USER", "postgres"), help="DB User")
+    parser.add_argument("--db-password", default=os.getenv("DB_PASSWORD", ""), help="DB Password")
     
     args = parser.parse_args()
     
