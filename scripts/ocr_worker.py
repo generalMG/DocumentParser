@@ -544,7 +544,8 @@ def _build_results(results_map, total_pages):
 
 def main():
     parser = argparse.ArgumentParser(description="Unified OCR Worker")
-    parser.add_argument("--device", default="gpu:0", help="Paddle device (e.g. gpu:0, cpu)")
+    parser.add_argument("--workers", type=int, default=1, help="Number of model worker processes to spawn")
+    parser.add_argument("--device", default="gpu:0", help="Paddle device or list (e.g. 'gpu:0' or 'gpu:0,gpu:1')")
     parser.add_argument("--model-dir", default=os.path.expanduser("~/.paddlex/official_models"), help="Directory for PaddleOCR models")
     
     parser.add_argument("--limit", type=int, default=10, help="Max number of papers to process in this run")
@@ -593,18 +594,26 @@ def main():
         
     logger.info(f"Found {len(paper_ids)} papers to process.")
 
-    # Start Model Process
+    # Start Model Processes
     mp_ctx = mp.get_context("spawn")
     task_queue = mp_ctx.Queue()
     result_queue = mp_ctx.Queue()
     
-    model_process = mp_ctx.Process(
-        target=_model_worker_loop,
-        args=(args.device, args.model_dir, task_queue, result_queue),
-        daemon=True
-    )
-    model_process.start()
-    logger.info("Model process started.")
+    workers = []
+    device_list = args.device.split(",")
+    
+    for i in range(args.workers):
+        # Round-robin assign devices if multiple are provided
+        dev = device_list[i % len(device_list)].strip()
+        
+        p = mp_ctx.Process(
+            target=_model_worker_loop,
+            args=(dev, args.model_dir, task_queue, result_queue),
+            daemon=True
+        )
+        p.start()
+        workers.append(p)
+        logger.info(f"Model worker {i+1}/{args.workers} started on {dev}")
 
     try:
         for i, pid in enumerate(paper_ids):
@@ -613,11 +622,15 @@ def main():
             
     finally:
         # Shutdown
+        # Shutdown
         logger.info("Shutting down...")
-        task_queue.put(None)
-        model_process.join(timeout=5)
-        if model_process.is_alive():
-            model_process.terminate()
+        for _ in workers:
+            task_queue.put(None)
+            
+        for p in workers:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
 
 if __name__ == "__main__":
     main()
