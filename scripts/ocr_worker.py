@@ -48,7 +48,8 @@ load_dotenv(override=True)
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("OCR_Worker")
 
@@ -207,6 +208,21 @@ def _to_serializable(obj: Any):
         return [x for x in [_to_serializable(i) for i in obj] if x is not None]
     if isinstance(obj, dict):
         return {k: v for k, v in {k: _to_serializable(v) for k, v in obj.items()}.items() if v is not None}
+    
+    # Handle composite objects (like PaddleOCRVLBlock)
+    if hasattr(obj, '__dict__'):
+        return _to_serializable(obj.__dict__)
+    
+    # Fallback for objects with slots or known fields
+    if hasattr(obj, 'label') and hasattr(obj, 'bbox'):
+        # Best effort extraction for Paddle objects
+        d = {}
+        if hasattr(obj, 'label'): d['label'] = obj.label
+        if hasattr(obj, 'bbox'): d['bbox'] = obj.bbox
+        if hasattr(obj, 'content'): d['content'] = obj.content
+        elif hasattr(obj, 'text'): d['content'] = obj.text
+        return _to_serializable(d)
+
     return obj
 
 def _cleanup_gpu_memory():
@@ -429,10 +445,14 @@ def process_paper(
     target_count = args.pages if args.pages else total_pages
     target_count = min(target_count, total_pages)
     
+    # Log render limit info
+    if args.render_page_limit and total_pages > args.render_page_limit:
+        logger.info(f"PDF {paper_id} has {total_pages} pages, capped at {args.render_page_limit} pages due to render limit.")
+    
     pages_needed = [p for p in range(target_count) if p not in processed_pages]
     
     if not pages_needed:
-        logger.info(f"Paper {paper_id} already complete.")
+        logger.info(f"Paper {paper_id} already complete ({len(processed_pages)} pages processed).")
         save_ocr_results(db, paper_id, _build_results(results_map, total_pages), completed=True)
         return True
 
@@ -454,6 +474,8 @@ def process_paper(
     
     # Split into batches
     batches = [pages_needed[i:i + batch_size] for i in range(0, len(pages_needed), batch_size)]
+    
+    logger.info(f"Processing {len(pages_needed)} pages in {len(batches)} batches (batch size {batch_size}) with {args.workers} GPU worker(s).")
     
     run_errors = []
     
@@ -617,8 +639,10 @@ def main():
 
     try:
         for i, pid in enumerate(paper_ids):
-            logger.info(f"[{i+1}/{len(paper_ids)}] Paper {pid}")
-            process_paper(pid, get_pdf_content(db, pid), db, task_queue, result_queue, args)
+            logger.info(f"[{i+1}/{len(paper_ids)}] Processing Paper {pid}")
+            success = process_paper(pid, get_pdf_content(db, pid), db, task_queue, result_queue, args)
+            status = "Completed" if success else "Incomplete/Failed"
+            logger.info(f"[{i+1}/{len(paper_ids)}] Finished {pid}: {status}")
             
     finally:
         # Shutdown
