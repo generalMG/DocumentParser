@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import gc
 import os
+import json
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
@@ -261,6 +262,8 @@ def _run_model_server(device: str, model_dir: str, task_queue: mp.Queue, result_
                     res = _process_pdf_page(*args, **kwargs)
                 elif func_name == "process_image_bytes":
                     res = _process_image_bytes(*args, **kwargs)
+                elif func_name == "process_batch_images":
+                    res = _process_batch_images(*args, **kwargs)
                 else:
                     res = {"ok": False, "error": f"Unknown function: {func_name}"}
             except Exception as e:
@@ -750,6 +753,42 @@ def _process_image_bytes(
         _cleanup_gpu_memory()
 
 
+def _process_batch_images(
+    image_bytes_list: List[bytes],
+    page_indices: List[str],  # Changed to str to match what we parse from JSON/Form, or convert later
+    dpi: Optional[int],
+    device: str,
+    model_dir: str
+) -> dict:
+    """Worker: process a batch of images efficiently."""
+    results = []
+    
+    # Ensure page_indices is a list
+    if not isinstance(page_indices, list):
+        page_indices = []
+
+    for i, image_bytes in enumerate(image_bytes_list):
+        # Determine page index for this image
+        page_idx = None
+        if i < len(page_indices):
+            # Try to convert to int if possible
+            try:
+                page_idx = int(page_indices[i])
+            except (ValueError, TypeError):
+                page_idx = None
+
+        res = _process_image_bytes(
+            image_bytes=image_bytes, 
+            page_index=page_idx, 
+            dpi=dpi, 
+            device=device, 
+            model_dir=model_dir
+        )
+        results.append(res)
+        
+    return {"ok": True, "results": results}
+
+
 
 async def _submit_task(func_name: str, *args, **kwargs) -> dict:
     """Submit a task to the model server and wait for the result."""
@@ -977,6 +1016,70 @@ async def ocr_image_endpoint(
 
     logger.info(f"OCR image successful for {file.filename} page {page}")
     return JSONResponse({"result": result.get("result")})
+
+
+@app.post("/ocr_batch")
+async def ocr_batch_endpoint(
+    files: List[UploadFile] = File(...),
+    pages: Optional[str] = Form(None), # JSON string of page indices e.g. "[1, 2, 3]"
+    dpi: Optional[int] = Form(None),
+):
+    # Create descriptive log message with limited filenames
+    file_names = [f.filename for f in files]
+    files_str = ", ".join(file_names[:3])
+    if len(file_names) > 3:
+        files_str += f", ... (+{len(file_names)-3} more)"
+    
+    logger.info(f"OCR batch request received: {len(files)} files ({files_str}), pages={pages}, dpi={dpi}")
+
+    # Parse pages JSON if provided
+    page_indices = []
+    if pages:
+        try:
+            parsed = json.loads(pages)
+            if isinstance(parsed, list):
+                page_indices = parsed
+        except Exception as e:
+            logger.warning(f"Failed to parse pages JSON: {e}")
+
+    try:
+        # Read all files concurrently
+        # For memory safety on very large batches we might want to be careful, 
+        # but for typical batch size (8-16) it's fine.
+        images_data = []
+        for file in files:
+            content = await file.read()
+            images_data.append(content)
+            
+        logger.info(f"Read {len(images_data)} images for batch processing")
+    except Exception as e:
+        logger.error(f"Failed to read batch files: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to read files: {e}")
+
+    try:
+        logger.info(f"Submitting batch task with {len(images_data)} images")
+        # Submit to queue
+        result = await _submit_task(
+            "process_batch_images", 
+            image_bytes_list=images_data, 
+            page_indices=page_indices, 
+            dpi=dpi, 
+            device=SERVICE_ARGS.device, 
+            model_dir=SERVICE_ARGS.model_dir
+        )
+        logger.info(f"OCR batch task completed")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"OCR batch execution failed: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"OCR batch failed: {e}")
+
+    if not result.get("ok"):
+        error_msg = result.get('error', 'Unknown error')
+        logger.error(f"OCR batch processing failed: {error_msg}")
+        raise HTTPException(status_code=500, detail=f"OCR batch failed: {error_msg}")
+
+    return JSONResponse({"results": result.get("results")})
 
 
 def parse_args():

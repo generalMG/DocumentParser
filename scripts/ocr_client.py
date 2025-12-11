@@ -11,6 +11,7 @@ OCR client that fetches PDFs from database and stores results back to database.
 """
 
 import argparse
+import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -247,6 +248,83 @@ def _process_single_image(
     return (page_num, page_result, None)
 
 
+def _send_batch_request(
+    paper_id: str,
+    page_images: Dict[int, bytes],
+    chunk: List[int],
+    service_url: str,
+    dpi: int
+) -> Tuple[Dict[int, dict], List[str]]:
+    """Send a batch of pages to the OCR service."""
+    # Construct multipart form data
+    files = []
+    page_indices = []
+    
+    for page_num in chunk:
+        img_bytes = page_images.get(page_num)
+        if not img_bytes:
+            continue
+            
+        filename = f"{paper_id}_page_{page_num + 1}.png"
+        files.append(('files', (filename, img_bytes, 'image/png')))
+        page_indices.append(page_num)
+
+    if not files:
+        return {}, []
+
+    # Determine batch URL
+    # Heuristic: replace last component if it looks like an endpoint, or just append if root
+    if service_url.endswith("/ocr_image") or service_url.endswith("/ocr_page") or service_url.endswith("/ocr"):
+        batch_url = service_url.rsplit('/', 1)[0] + "/ocr_batch"
+    else:
+        # Fallback or assume it is the base
+        batch_url = f"{service_url.rstrip('/')}/ocr_batch"
+
+    try:
+        data = {
+            "pages": json.dumps(page_indices),
+            "dpi": dpi
+        }
+        resp = requests.post(batch_url, files=files, data=data, timeout=6000) # Long timeout for batch
+    except Exception as e:
+        return {}, [f"batch request failed: {e}"]
+
+    if resp.status_code != 200:
+        return {}, [f"service error {resp.status_code}: {resp.text}"]
+
+    try:
+        payload = resp.json()
+    except Exception as e:
+        return {}, [f"failed to parse JSON: {e}"]
+
+    results_list = payload.get("results")
+    if not isinstance(results_list, list):
+         return {}, ["invalid response format: 'results' is not a list"]
+
+    # Map results back to pages
+    # We assume results are in order of files sent
+    results_map = {}
+    errors = []
+    
+    for i, res in enumerate(results_list):
+        if i >= len(page_indices):
+            break
+        
+        page_num = page_indices[i]
+        
+        if not res.get("ok"):
+            err = res.get("error", "unknown error")
+            errors.append(f"page {page_num}: {err}")
+            continue
+            
+        # Success
+        result_data = res.get("result")
+        if result_data:
+            results_map[page_num] = result_data
+
+    return results_map, errors
+
+
 def process_pdf_to_db(
     db: DatabaseManager,
     paper_id: str,
@@ -359,42 +437,33 @@ def process_pdf_to_db(
                 errors.append(error_msg)
                 continue
 
-            # Send chunk with limited concurrency
-            concurrency = min(gpu_workers, page_batch_size, len(chunk))
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = {
-                    executor.submit(
-                        _process_single_image,
-                        paper_id,
-                        page_num,
-                        page_images.get(page_num),
-                        service_url,
-                        render_dpi,
-                    ): page_num
-                    for page_num in chunk
-                }
+            # Send chunk as batch
+            batch_results, batch_errors = _send_batch_request(
+                paper_id,
+                page_images,
+                chunk,
+                service_url,
+                render_dpi
+            )
 
-                for future in as_completed(futures):
-                    page_num = futures[future]
-                    try:
-                        pg, result, error = future.result()
-                        if error:
-                            errors.append(f"page {pg}: {error}")
-                            print(f"  Page {pg + 1}/{total_pages}: ERROR - {error}")
-                        elif result is not None:
-                            results_dict[pg] = result
-                            completed_pages.add(pg)
-                            processed += 1
-                            print(
-                                f"  Page {pg + 1}/{total_pages}: OK "
-                                f"({processed}/{len(pages_to_process)})"
-                            )
-
-                            # Save incrementally (without completed flag) for resume support
-                            save_ocr_results(db, paper_id, _build_results(results_dict, total_pages))
-                    except Exception as e:
-                        errors.append(f"page {page_num}: exception {e}")
-                        print(f"  Page {page_num + 1}/{total_pages}: EXCEPTION - {e}")
+            if batch_errors:
+                for err in batch_errors:
+                     errors.append(err)
+                     print(f"  Page chunk {chunk[0]}-{chunk[-1]}: ERROR - {err}")
+            
+            # Process results
+            if batch_results:
+                for pg, result in batch_results.items():
+                    results_dict[pg] = result
+                    completed_pages.add(pg)
+                    processed += 1
+                    print(
+                        f"  Page {pg + 1}/{total_pages}: OK "
+                        f"({processed}/{len(pages_to_process)})"
+                    )
+                
+                # Save incrementally (without completed flag) for resume support
+                save_ocr_results(db, paper_id, _build_results(results_dict, total_pages))
 
     # Final save logic
     # We only mark completed=True if we have actually finished ALL pages for the target,
