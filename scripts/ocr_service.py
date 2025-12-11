@@ -256,6 +256,25 @@ def _run_model_server(device: str, model_dir: str, task_queue: mp.Queue, result_
                     res = {"ok": True, "results": [{"page_index": "0", "content": "Mock OCR Result", "layout_det_res": {"boxes": []}, "dpi": 200}]}
                     if func_name == "process_pdf_page":
                          res = {"ok": True, "result": {"content": "Mock Page Result"}, "total_pages": 5}
+                    elif func_name == "process_batch_images":
+                        # Handle batch mock
+                        num_images = 1
+                        if kwargs.get("image_bytes_list"):
+                            num_images = len(kwargs["image_bytes_list"])
+                        elif args and isinstance(args[0], list):
+                            num_images = len(args[0])
+                            
+                        batch_results = []
+                        # Retrieve page indices if available to be accurate
+                        page_indices = kwargs.get("page_indices") or []
+                        
+                        for i in range(num_images):
+                            pg_idx = page_indices[i] if i < len(page_indices) else i
+                            batch_results.append({
+                                "ok": True, 
+                                "result": {"content": f"Mock Batch Result {i}", "page_index": pg_idx, "dpi": 200}
+                            })
+                        res = {"ok": True, "results": batch_results}
                 elif func_name == "process_pdf":
                     res = _process_pdf(*args, **kwargs)
                 elif func_name == "process_pdf_page":
