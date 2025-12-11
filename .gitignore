@@ -48,3 +48,4 @@ test_torch_conversion.py
 debug_dpi*
 test_ocr_refactor.py
 *tests/*
+test_ocr_worker_logic.py
