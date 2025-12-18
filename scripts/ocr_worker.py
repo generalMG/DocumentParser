@@ -122,6 +122,7 @@ DEFAULT_RENDER_DPI = 200
 RENDER_PAGE_LIMIT = 100
 DEFAULT_PAGE_BATCH_SIZE = 8
 TIMEOUT_SECONDS = 3600
+MAX_TASKS_PER_WORKER = 500  # Restart worker after N tasks to clear VRAM
 
 # -----------------------------------------------------------------------------
 # Database Utils (from ocr_client.py)
@@ -308,7 +309,11 @@ def _process_image_bytes(image_bytes: bytes) -> dict:
         
         with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
             image.save(tmp.name)
-            results = _MODEL.predict(tmp.name)
+            
+            # Use no_grad to prevent gradient accumulation (VRAM leak)
+            import paddle
+            with paddle.no_grad():
+                results = _MODEL.predict(tmp.name)
         
         # Enrich results (simplified from original service: just pass through for now)
         # In original service there was _enrich_results logic matching layout boxes to content.
@@ -352,7 +357,14 @@ def _model_worker_loop(device: str, model_dir: str, task_queue: mp.Queue, result
             logger.error(f"Model init failed: {init_res['error']}")
             return
 
+    tasks_processed = 0
+    
     while True:
+        # Check recycling limit
+        if tasks_processed >= MAX_TASKS_PER_WORKER:
+            logger.info(f"Worker reached {MAX_TASKS_PER_WORKER} tasks. Recycling process to clear VRAM.")
+            break
+
         try:
             task = task_queue.get()
             if task is None: # Sentinel
@@ -367,7 +379,8 @@ def _model_worker_loop(device: str, model_dir: str, task_queue: mp.Queue, result
                 res = _process_image_bytes(img_bytes)
                 if res["ok"] and isinstance(res["result"], dict):
                     res["result"]["page_index"] = page_idx
-            
+                    
+            tasks_processed += 1
             result_queue.put((req_id, res, page_idx))
             
         except Exception as e:
@@ -624,18 +637,20 @@ def main():
     workers = []
     device_list = args.device.split(",")
     
-    for i in range(args.workers):
-        # Round-robin assign devices if multiple are provided
-        dev = device_list[i % len(device_list)].strip()
-        
+    def spawn_worker(index):
+        dev = device_list[index % len(device_list)].strip()
         p = mp_ctx.Process(
             target=_model_worker_loop,
             args=(dev, args.model_dir, task_queue, result_queue),
             daemon=True
         )
         p.start()
-        workers.append(p)
-        logger.info(f"Model worker {i+1}/{args.workers} started on {dev}")
+        logger.info(f"Model worker {index+1}/{args.workers} started on {dev} (PID: {p.pid})")
+        return p
+
+    # Initial spawn
+    for i in range(args.workers):
+        workers.append(spawn_worker(i))
 
     try:
         for i, pid in enumerate(paper_ids):
@@ -643,6 +658,13 @@ def main():
             success = process_paper(pid, get_pdf_content(db, pid), db, task_queue, result_queue, args)
             status = "Completed" if success else "Incomplete/Failed"
             logger.info(f"[{i+1}/{len(paper_ids)}] Finished {pid}: {status}")
+            
+            # Check/Respawn dead workers (recycling)
+            for idx, p in enumerate(workers):
+                if not p.is_alive():
+                    logger.info(f"Worker {idx+1} (PID {p.pid}) found dead/recycled. Respawning...")
+                    p.join() # Clean up zombie
+                    workers[idx] = spawn_worker(idx)
             
     finally:
         # Shutdown
