@@ -122,7 +122,7 @@ DEFAULT_RENDER_DPI = 200
 RENDER_PAGE_LIMIT = 100
 DEFAULT_PAGE_BATCH_SIZE = 8
 TIMEOUT_SECONDS = 3600
-MAX_TASKS_PER_WORKER = 500  # Restart worker after N tasks to clear VRAM
+MAX_TASKS_PER_WORKER = 100  # Restart worker after N tasks to clear VRAM
 
 # -----------------------------------------------------------------------------
 # Database Utils (from ocr_client.py)
@@ -234,6 +234,18 @@ def _cleanup_gpu_memory():
     except: pass
     gc.collect()
 
+def _log_gpu_memory(prefix=""):
+    """Log current GPU memory usage for debugging."""
+    try:
+        import paddle
+        if paddle.device.is_compiled_with_cuda():
+            # Get memory info
+            allocated = paddle.device.cuda.memory_allocated() / (1024**2)
+            reserved = paddle.device.cuda.memory_reserved() / (1024**2)
+            logger.debug(f"{prefix}GPU Memory: {allocated:.0f}MB allocated, {reserved:.0f}MB reserved")
+    except Exception as e:
+        pass  # Silently ignore if not available
+
 def _check_gpu_availability(device: str) -> dict:
     try:
         import paddle
@@ -298,22 +310,28 @@ def _init_model(device: str, model_dir: str) -> dict:
 def _process_image_bytes(image_bytes: bytes) -> dict:
     # Process single image bytes -> OCR result
     global _MODEL
+    worker_pid = os.getpid()
     try:
         from PIL import Image
         image = Image.open(BytesIO(image_bytes))
         dpi_info = getattr(image, "info", {}).get("dpi")
         image_dpi = int(dpi_info[0]) if dpi_info else None
+        img_size = image.size
+        logger.debug(f"[Worker {worker_pid}] Processing image {img_size[0]}x{img_size[1]}")
 
         if image.mode not in ("RGB", "RGBA"):
             image = image.convert("RGB")
-        
+
         with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
             image.save(tmp.name)
-            
+            _log_gpu_memory(f"[Worker {worker_pid}] Before predict: ")
+
             # Use no_grad to prevent gradient accumulation (VRAM leak)
             import paddle
             with paddle.no_grad():
                 results = _MODEL.predict(tmp.name)
+
+            _log_gpu_memory(f"[Worker {worker_pid}] After predict: ")
         
         # Enrich results (simplified from original service: just pass through for now)
         # In original service there was _enrich_results logic matching layout boxes to content.
@@ -347,6 +365,9 @@ def _model_worker_loop(device: str, model_dir: str, task_queue: mp.Queue, result
     Reads (request_id, image_bytes, page_index) from task_queue.
     Writes (request_id, result_dict, page_index) to result_queue.
     """
+    worker_pid = os.getpid()
+    logger.info(f"[Worker {worker_pid}] Starting on {device}")
+
     # Init
     if os.environ.get("OCR_MOCK_MODE"):
         logger.info("MOCK MODE: Skipping model load")
@@ -354,24 +375,26 @@ def _model_worker_loop(device: str, model_dir: str, task_queue: mp.Queue, result
     else:
         init_res = _init_model(device, model_dir)
         if not init_res["ok"]:
-            logger.error(f"Model init failed: {init_res['error']}")
+            logger.error(f"[Worker {worker_pid}] Model init failed: {init_res['error']}")
             return
 
     tasks_processed = 0
-    
+
     while True:
         # Check recycling limit
         if tasks_processed >= MAX_TASKS_PER_WORKER:
-            logger.info(f"Worker reached {MAX_TASKS_PER_WORKER} tasks. Recycling process to clear VRAM.")
+            logger.info(f"[Worker {worker_pid}] Reached {MAX_TASKS_PER_WORKER} tasks. Recycling to clear VRAM.")
             break
 
         try:
-            task = task_queue.get()
-            if task is None: # Sentinel
+            task = task_queue.get(timeout=30)  # Add timeout to detect hangs
+            if task is None:  # Sentinel
+                logger.info(f"[Worker {worker_pid}] Received shutdown signal")
                 break
-            
+
             req_id, img_bytes, page_idx = task
-            
+            logger.debug(f"[Worker {worker_pid}] Processing page {page_idx} (task {tasks_processed + 1})")
+
             if os.environ.get("OCR_MOCK_MODE"):
                 time.sleep(0.1)
                 res = {"ok": True, "result": {"content": f"Mock Content {page_idx}", "page_index": page_idx}}
@@ -379,12 +402,24 @@ def _model_worker_loop(device: str, model_dir: str, task_queue: mp.Queue, result
                 res = _process_image_bytes(img_bytes)
                 if res["ok"] and isinstance(res["result"], dict):
                     res["result"]["page_index"] = page_idx
-                    
+
             tasks_processed += 1
             result_queue.put((req_id, res, page_idx))
-            
+            logger.debug(f"[Worker {worker_pid}] Completed page {page_idx}")
+
+        except mp.queues.Empty:
+            # Queue empty, just continue waiting
+            continue
         except Exception as e:
-            logger.error(f"Worker loop error: {e}")
+            logger.error(f"[Worker {worker_pid}] Loop error: {e}\n{traceback.format_exc()}")
+            # Try to send error response if we have context
+            try:
+                if 'req_id' in dir() and 'page_idx' in dir():
+                    result_queue.put((req_id, {"ok": False, "error": str(e)}, page_idx))
+            except:
+                pass
+
+    logger.info(f"[Worker {worker_pid}] Exiting after {tasks_processed} tasks")
 
 # -----------------------------------------------------------------------------
 # Main Process Logic
@@ -423,12 +458,14 @@ def _render_pdf_chunk(pdf_bytes: bytes, pages: List[int], dpi: int = 200) -> Dic
     return results
 
 def process_paper(
-    paper_id: str, 
-    pdf_bytes: bytes, 
-    db: DatabaseManager, 
-    task_queue: mp.Queue, 
+    paper_id: str,
+    pdf_bytes: bytes,
+    db: DatabaseManager,
+    task_queue: mp.Queue,
     result_queue: mp.Queue,
-    args
+    args,
+    workers: list = None,  # Pass workers for health check
+    spawn_worker_fn=None   # Callback to respawn dead workers
 ):
     """Process a single paper: render -> queue -> wait -> save."""
     
@@ -514,29 +551,41 @@ def process_paper(
         batch_collected = 0
         batch_start = time.time()
         
+        consecutive_timeouts = 0
+        max_consecutive_timeouts = 6  # 60 seconds of no response = likely dead worker
+
         while batch_collected < pending_count:
-            if time.time() - batch_start > 600: # 10 min timeout per batch
+            elapsed = time.time() - batch_start
+            if elapsed > 600:  # 10 min timeout per batch
                 run_errors.append("Batch timeout")
+                logger.error(f"Batch timeout after {elapsed:.1f}s. Collected {batch_collected}/{pending_count} results.")
                 break
-            
+
+            # Check worker health if workers list provided
+            if workers:
+                dead_workers = [i for i, w in enumerate(workers) if not w.is_alive()]
+                if dead_workers:
+                    logger.warning(f"WORKER(S) DIED during batch processing: {dead_workers}")
+                    if spawn_worker_fn:
+                        # Respawn dead workers
+                        for idx in dead_workers:
+                            logger.info(f"Respawning worker {idx}...")
+                            workers[idx].join(timeout=1)  # Clean up zombie
+                            workers[idx] = spawn_worker_fn(idx)
+                            time.sleep(2)  # Give worker time to init model
+                        logger.info("Workers respawned, continuing batch...")
+                    else:
+                        run_errors.append(f"Worker died: {dead_workers}")
+                        break
+
             try:
-                # Poll result queue
-                # We might get results for other requests if we had parallel processing, 
-                # but here we are synchronous per paper in the main loop.
-                # However, the queue is shared. We should peek/get.
-                # Since we have only 1 main process pushing, we can just get().
-                # WARNING: If we ever have multiple main fetchers, this logic needs to filter by req_id.
-                # For now, we assume 1 main fetcher process.
-                
-                r_req_id, r_res, r_pidx = result_queue.get(timeout=10) 
-                
+                r_req_id, r_res, r_pidx = result_queue.get(timeout=10)
+                consecutive_timeouts = 0  # Reset on successful get
+
                 if r_req_id != req_id:
-                    # Should not happen in single-producer usage
-                    logger.warning(f"Received mismatched result {r_req_id} (expected {req_id}). Putting back.")
-                    # In a real multi-producer scenario, we'd need a per-process dict or callback.
-                    # Use a separate queue per producer or just ignore this for now as we are 1 worker.
+                    logger.warning(f"Discarding mismatched result for {r_req_id} (curr: {req_id}). Likely stale.")
                     continue
-                
+
                 if r_res["ok"]:
                     results_map[r_pidx] = r_res["result"]
                     processed_pages.add(r_pidx)
@@ -544,15 +593,25 @@ def process_paper(
                     print(f"  Page {r_pidx+1}/{total_pages} OK")
                 else:
                     err = r_res.get("error")
+                    logger.error(f"Page {r_pidx} failed: {err}")
                     run_errors.append(f"Page {r_pidx}: {err}")
-                    batch_collected += 1 # Count it as 'done' but failed
-                    
-            except UnicodeDecodeError:
-                # Sometimes queue getting fails?
-                pass
-            except Exception:
-                # Queue empty or timeout
-                pass
+                    batch_collected += 1
+
+            except UnicodeDecodeError as e:
+                logger.warning(f"UnicodeDecodeError on queue get: {e}")
+            except Exception as e:
+                consecutive_timeouts += 1
+                if consecutive_timeouts >= max_consecutive_timeouts:
+                    logger.error(f"No response for {consecutive_timeouts * 10}s. Worker likely dead.")
+                    # Log queue sizes for debugging
+                    try:
+                        logger.error(f"Task queue size: ~{task_queue.qsize()}, Result queue size: ~{result_queue.qsize()}")
+                    except:
+                        pass
+                    run_errors.append("Worker unresponsive")
+                    break
+                elif consecutive_timeouts % 3 == 0:  # Log every 30 seconds
+                    logger.warning(f"Waiting for results... {batch_collected}/{pending_count} collected, {elapsed:.0f}s elapsed")
 
         # Checkpoint save
         save_ocr_results(db, paper_id, _build_results(results_map, total_pages))
@@ -597,8 +656,15 @@ def main():
     parser.add_argument("--db-name", default=os.getenv("DB_NAME", "arxiv"), help="DB Name")
     parser.add_argument("--db-user", default=os.getenv("DB_USER", "postgres"), help="DB User")
     parser.add_argument("--db-password", default=os.getenv("DB_PASSWORD", ""), help="DB Password")
-    
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging for GPU memory and worker status")
+
     args = parser.parse_args()
+
+    # Set debug logging level if requested
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.info("Debug logging enabled")
     
     # Setup DB
     db = DatabaseManager(
@@ -655,7 +721,10 @@ def main():
     try:
         for i, pid in enumerate(paper_ids):
             logger.info(f"[{i+1}/{len(paper_ids)}] Processing Paper {pid}")
-            success = process_paper(pid, get_pdf_content(db, pid), db, task_queue, result_queue, args)
+            success = process_paper(
+                pid, get_pdf_content(db, pid), db, task_queue, result_queue, args,
+                workers=workers, spawn_worker_fn=spawn_worker
+            )
             status = "Completed" if success else "Incomplete/Failed"
             logger.info(f"[{i+1}/{len(paper_ids)}] Finished {pid}: {status}")
             
