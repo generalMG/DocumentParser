@@ -532,7 +532,7 @@ def process_paper(
     for batch in batches:
         # Render
         try:
-            images_map = _render_pdf_chunk(pdf_bytes, batch, dpi=DEFAULT_RENDER_DPI)
+            images_map = _render_pdf_chunk(pdf_bytes, batch, dpi=args.render_dpi)
         except Exception as e:
             err = f"Render failed for pages {batch}: {e}"
             logger.error(err)
@@ -552,7 +552,7 @@ def process_paper(
         batch_start = time.time()
         
         consecutive_timeouts = 0
-        max_consecutive_timeouts = 6  # 60 seconds of no response = likely dead worker
+        max_consecutive_timeouts = 30  # 300 seconds (5 mins) to allow for slow model load/inference
 
         while batch_collected < pending_count:
             elapsed = time.time() - batch_start
@@ -648,6 +648,7 @@ def main():
     parser.add_argument("--retry-errors", action="store_true", help="Retry papers that previously failed with errors")
     
     parser.add_argument("--render-page-limit", type=int, default=RENDER_PAGE_LIMIT, help="Max pages to render per paper to avoid OOM on huge PDFs")
+    parser.add_argument("--render-dpi", type=int, default=DEFAULT_RENDER_DPI, help="DPI to render PDF pages at (lower to reduce VRAM usage, e.g. 100)")
     parser.add_argument("--page-batch-size", type=int, default=DEFAULT_PAGE_BATCH_SIZE, help="Number of pages to render/process in a single batch")
     
     parser.add_argument("--db-url", default=os.getenv("SQLALCHEMY_URL"), help="Full SQLAlchemy DB URL")
