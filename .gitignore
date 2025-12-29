@@ -50,3 +50,4 @@ test_ocr_refactor.py
 *tests/*
 test_ocr_worker_logic.py
 vram_log_*.txt
+*loader.py*

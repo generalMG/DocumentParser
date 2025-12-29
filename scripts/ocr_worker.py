@@ -123,6 +123,7 @@ RENDER_PAGE_LIMIT = 100
 DEFAULT_PAGE_BATCH_SIZE = 8
 TIMEOUT_SECONDS = 3600
 MAX_TASKS_PER_WORKER = 100  # Restart worker after N tasks to clear VRAM
+DEFAULT_RENDER_WORKERS = 4  # Parallel threads for PDF page rendering
 
 # -----------------------------------------------------------------------------
 # Database Utils (from ocr_client.py)
@@ -425,36 +426,41 @@ def _model_worker_loop(device: str, model_dir: str, task_queue: mp.Queue, result
 # Main Process Logic
 # -----------------------------------------------------------------------------
 
-def _render_pdf_chunk(pdf_bytes: bytes, pages: List[int], dpi: int = 200) -> Dict[int, bytes]:
-    """Render specific pages to PNG bytes."""
-    if not pages: return {}
-    # pdf2image uses 1-based indexing. pages list is 0-based.
-    # To be efficient, if pages are contiguous we can do one call, but pages might be scattered.
-    # For now, simplistic approach: render chunk range if contiguous, else one by one?
-    # Original client logic used contiguous chunks.
-    
-    # Let's just render the whole range covered by pages to minimize subprocess calls, 
-    # then pick what we need.
-    min_p = min(pages)
-    max_p = max(pages)
-    
-    # Warning: if min=0 and max=100, we render 100 pages. 
-    # Ideally pages passed here are already a small batch.
-    
-    images = convert_from_bytes(
-        pdf_bytes,
-        dpi=dpi,
-        first_page=min_p + 1,
-        last_page=max_p + 1
-    )
-    
-    results = {}
-    for i, img in enumerate(images):
-        p_idx = min_p + i
-        if p_idx in pages:
+def _render_single_page(args: Tuple[bytes, int, int]) -> Tuple[int, Optional[bytes]]:
+    """Render a single PDF page to PNG bytes. Used for parallel rendering."""
+    pdf_bytes, page_idx, dpi = args
+    try:
+        images = convert_from_bytes(
+            pdf_bytes,
+            dpi=dpi,
+            first_page=page_idx + 1,  # pdf2image uses 1-based indexing
+            last_page=page_idx + 1
+        )
+        if images:
             with BytesIO() as buf:
-                img.save(buf, format="PNG")
-                results[p_idx] = buf.getvalue()
+                images[0].save(buf, format="PNG")
+                return (page_idx, buf.getvalue())
+    except Exception as e:
+        logger.warning(f"Failed to render page {page_idx}: {e}")
+    return (page_idx, None)
+
+
+def _render_pdf_chunk(pdf_bytes: bytes, pages: List[int], dpi: int = 200, max_workers: int = DEFAULT_RENDER_WORKERS) -> Dict[int, bytes]:
+    """Render specific pages to PNG bytes using parallel ThreadPoolExecutor."""
+    if not pages:
+        return {}
+
+    # Prepare arguments for parallel rendering
+    render_args = [(pdf_bytes, p, dpi) for p in pages]
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for page_idx, img_bytes in executor.map(_render_single_page, render_args):
+            if img_bytes:
+                results[page_idx] = img_bytes
+            else:
+                logger.warning(f"Page {page_idx} rendered empty/failed")
+
     return results
 
 def process_paper(
@@ -525,14 +531,14 @@ def process_paper(
     # Split into batches
     batches = [pages_needed[i:i + batch_size] for i in range(0, len(pages_needed), batch_size)]
     
-    logger.info(f"Processing {len(pages_needed)} pages in {len(batches)} batches (batch size {batch_size}) with {args.workers} GPU worker(s).")
+    logger.info(f"Processing {len(pages_needed)} pages in {len(batches)} batches (batch size {batch_size}) with {args.workers} GPU worker(s), {args.render_workers} render threads.")
     
     run_errors = []
     
     for batch in batches:
-        # Render
+        # Render (parallel)
         try:
-            images_map = _render_pdf_chunk(pdf_bytes, batch, dpi=args.render_dpi)
+            images_map = _render_pdf_chunk(pdf_bytes, batch, dpi=args.render_dpi, max_workers=args.render_workers)
         except Exception as e:
             err = f"Render failed for pages {batch}: {e}"
             logger.error(err)
@@ -649,6 +655,7 @@ def main():
     
     parser.add_argument("--render-page-limit", type=int, default=RENDER_PAGE_LIMIT, help="Max pages to render per paper to avoid OOM on huge PDFs")
     parser.add_argument("--render-dpi", type=int, default=DEFAULT_RENDER_DPI, help="DPI to render PDF pages at (lower to reduce VRAM usage, e.g. 100)")
+    parser.add_argument("--render-workers", type=int, default=DEFAULT_RENDER_WORKERS, help="Number of parallel threads for PDF page rendering")
     parser.add_argument("--page-batch-size", type=int, default=DEFAULT_PAGE_BATCH_SIZE, help="Number of pages to render/process in a single batch")
     
     parser.add_argument("--db-url", default=os.getenv("SQLALCHEMY_URL"), help="Full SQLAlchemy DB URL")
