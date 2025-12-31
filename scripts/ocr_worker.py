@@ -314,6 +314,8 @@ def _process_image_bytes(image_bytes: bytes) -> dict:
     worker_pid = os.getpid()
     try:
         from PIL import Image
+        import numpy as np
+
         image = Image.open(BytesIO(image_bytes))
         dpi_info = getattr(image, "info", {}).get("dpi")
         image_dpi = int(dpi_info[0]) if dpi_info else None
@@ -323,16 +325,17 @@ def _process_image_bytes(image_bytes: bytes) -> dict:
         if image.mode not in ("RGB", "RGBA"):
             image = image.convert("RGB")
 
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
-            image.save(tmp.name)
-            _log_gpu_memory(f"[Worker {worker_pid}] Before predict: ")
+        # Convert PIL Image to numpy array (RGB format, HWC)
+        img_array = np.array(image)
 
-            # Use no_grad to prevent gradient accumulation (VRAM leak)
-            import paddle
-            with paddle.no_grad():
-                results = _MODEL.predict(tmp.name)
+        _log_gpu_memory(f"[Worker {worker_pid}] Before predict: ")
 
-            _log_gpu_memory(f"[Worker {worker_pid}] After predict: ")
+        # Use no_grad to prevent gradient accumulation (VRAM leak)
+        import paddle
+        with paddle.no_grad():
+            results = _MODEL.predict(img_array)
+
+        _log_gpu_memory(f"[Worker {worker_pid}] After predict: ")
         
         # Enrich results (simplified from original service: just pass through for now)
         # In original service there was _enrich_results logic matching layout boxes to content.
