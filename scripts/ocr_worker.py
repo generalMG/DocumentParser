@@ -124,6 +124,7 @@ DEFAULT_PAGE_BATCH_SIZE = 8
 TIMEOUT_SECONDS = 3600
 MAX_TASKS_PER_WORKER = 100  # Restart worker after N tasks to clear VRAM
 DEFAULT_RENDER_WORKERS = 4  # Parallel threads for PDF page rendering
+MAX_QUEUE_SIZE = 64  # Hard cap for queue depth to avoid unbounded memory growth
 
 # -----------------------------------------------------------------------------
 # Database Utils (from ocr_client.py)
@@ -552,8 +553,13 @@ def process_paper(
         req_id = str(uuid.uuid4())
         pending_count = 0
         for p_idx, img_data in images_map.items():
-            task_queue.put((req_id, img_data, p_idx))
-            pending_count += 1
+            try:
+                task_queue.put((req_id, img_data, p_idx), timeout=30)
+                pending_count += 1
+            except Exception as e:
+                err = f"Failed to enqueue page {p_idx}: {e}"
+                logger.error(err)
+                run_errors.append(err)
             
         # Wait for results
         # We need to collect exactly 'pending_count' results for this req_id or time out
@@ -671,6 +677,17 @@ def main():
 
     args = parser.parse_args()
 
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
+    if args.render_workers < 1:
+        parser.error("--render-workers must be >= 1")
+    if args.page_batch_size < 1:
+        parser.error("--page-batch-size must be >= 1")
+    if args.page_batch_size > MAX_QUEUE_SIZE:
+        parser.error(f"--page-batch-size must be <= {MAX_QUEUE_SIZE}")
+    if args.render_page_limit < 1:
+        parser.error("--render-page-limit must be >= 1")
+
     # Set debug logging level if requested
     if args.debug:
         logger.setLevel(logging.DEBUG)
@@ -708,8 +725,10 @@ def main():
 
     # Start Model Processes
     mp_ctx = mp.get_context("spawn")
-    task_queue = mp_ctx.Queue()
-    result_queue = mp_ctx.Queue()
+    queue_maxsize = min(MAX_QUEUE_SIZE, max(8, args.workers * args.page_batch_size * 2))
+    task_queue = mp_ctx.Queue(maxsize=queue_maxsize)
+    result_queue = mp_ctx.Queue(maxsize=queue_maxsize)
+    logger.info(f"Using bounded queues (maxsize={queue_maxsize})")
     
     workers = []
     device_list = args.device.split(",")
