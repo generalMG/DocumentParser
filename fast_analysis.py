@@ -25,7 +25,7 @@ def process_chunk(lines):
 
                 # Count versions
                 version_counter[len(article['versions'])] += 1
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             errors += 1
 
     return year_counter, version_counter, errors
