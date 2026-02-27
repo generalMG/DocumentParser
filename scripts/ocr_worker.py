@@ -37,7 +37,7 @@ from PyPDF2 import PdfReader
 # Add project root to path for database imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 try:
-    from database.database import DatabaseManager
+    from database.database import DatabaseManager, resolve_db_password
     from database.models import ArxivPaper
 except ImportError:
     # Fallback/Mock for testing if run outside full project context
@@ -672,7 +672,16 @@ def main():
     parser.add_argument("--db-port", type=int, default=int(os.getenv("DB_PORT", "5432")), help="DB Port")
     parser.add_argument("--db-name", default=os.getenv("DB_NAME", "arxiv"), help="DB Name")
     parser.add_argument("--db-user", default=os.getenv("DB_USER", "postgres"), help="DB User")
-    parser.add_argument("--db-password", default=os.getenv("DB_PASSWORD", ""), help="DB Password")
+    parser.add_argument(
+        "--db-password-file",
+        default=os.getenv("DB_PASSWORD_FILE"),
+        help="Read DB password from this file path",
+    )
+    parser.add_argument(
+        "--prompt-db-password",
+        action="store_true",
+        help="Prompt for DB password securely",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for GPU memory and worker status")
 
     args = parser.parse_args()
@@ -688,6 +697,11 @@ def main():
     if args.render_page_limit < 1:
         parser.error("--render-page-limit must be >= 1")
 
+    db_password = resolve_db_password(
+        password_file=args.db_password_file,
+        prompt=args.prompt_db_password,
+    )
+
     # Set debug logging level if requested
     if args.debug:
         logger.setLevel(logging.DEBUG)
@@ -701,7 +715,7 @@ def main():
         db_port=args.db_port,
         db_name=args.db_name,
         db_user=args.db_user,
-        db_password=args.db_password,
+        db_password=db_password,
     )
     # Check DB connection
     try:

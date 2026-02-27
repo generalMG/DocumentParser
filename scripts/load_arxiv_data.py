@@ -23,7 +23,7 @@ load_dotenv(override=True)
 
 from sqlalchemy.dialects.postgresql import insert
 
-from database.database import DatabaseManager
+from database.database import DatabaseManager, resolve_db_password
 from database.models import ArxivPaper, ArxivCategory, ArxivPaperCategory
 from database.path_security import safe_pdf_filename
 
@@ -329,9 +329,14 @@ def main():
         help='Database user'
     )
     parser.add_argument(
-        '--db-password',
-        default=os.getenv('DB_PASSWORD', ''),
-        help='Database password'
+        '--db-password-file',
+        default=os.getenv('DB_PASSWORD_FILE'),
+        help='Read database password from this file path'
+    )
+    parser.add_argument(
+        '--prompt-db-password',
+        action='store_true',
+        help='Prompt for database password securely'
     )
     parser.add_argument(
         '--pdf-path',
@@ -352,6 +357,10 @@ def main():
     )
 
     args = parser.parse_args()
+    db_password = resolve_db_password(
+        password_file=args.db_password_file,
+        prompt=args.prompt_db_password,
+    )
 
     # Create loader instance
     loader = ArxivLoader(
@@ -360,7 +369,7 @@ def main():
         db_port=args.db_port,
         db_name=args.db_name,
         db_user=args.db_user,
-        db_password=args.db_password,
+        db_password=db_password,
         pdf_base_path=args.pdf_path
     )
 

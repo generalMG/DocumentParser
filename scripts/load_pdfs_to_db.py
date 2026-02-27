@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv(override=True)
 
 from sqlalchemy import update, select
-from database.database import DatabaseManager, get_database_url_from_env
+from database.database import DatabaseManager, get_database_url_from_env, resolve_db_password
 from database.models import ArxivPaper
 
 
@@ -192,9 +192,22 @@ def main():
     parser.add_argument('--db-port', type=int, default=None, help='Database port (overrides .env)')
     parser.add_argument('--db-name', default=None, help='Database name (overrides .env)')
     parser.add_argument('--db-user', default=None, help='Database user (overrides .env)')
-    parser.add_argument('--db-password', default=None, help='Database password (overrides .env)')
+    parser.add_argument(
+        '--db-password-file',
+        default=os.getenv('DB_PASSWORD_FILE'),
+        help='Read database password from this file path'
+    )
+    parser.add_argument(
+        '--prompt-db-password',
+        action='store_true',
+        help='Prompt for database password securely'
+    )
 
     args = parser.parse_args()
+    db_password = resolve_db_password(
+        password_file=args.db_password_file,
+        prompt=args.prompt_db_password,
+    )
 
     # Get PDF directory from args or .env
     pdf_directory = args.pdf_directory or os.getenv('PDF_BASE_PATH', './arxiv_pdfs')
@@ -206,7 +219,7 @@ def main():
         db_port=args.db_port,
         db_name=args.db_name,
         db_user=args.db_user,
-        db_password=args.db_password
+        db_password=db_password
     )
 
     # Load PDFs

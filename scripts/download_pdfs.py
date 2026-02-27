@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 load_dotenv(override=True)
 
-from database.database import DatabaseManager  # noqa: E402
+from database.database import DatabaseManager, resolve_db_password  # noqa: E402
 from database.models import ArxivPaper  # noqa: E402
 from database.path_security import normalize_arxiv_id, safe_pdf_path  # noqa: E402
 
@@ -241,9 +241,14 @@ def parse_args():
         help="Database user",
     )
     parser.add_argument(
-        "--db-password",
-        default=os.getenv("DB_PASSWORD", ""),
-        help="Database password",
+        "--db-password-file",
+        default=os.getenv("DB_PASSWORD_FILE"),
+        help="Read database password from this file path",
+    )
+    parser.add_argument(
+        "--prompt-db-password",
+        action="store_true",
+        help="Prompt for database password securely",
     )
     parser.add_argument(
         "--pdf-path",
@@ -300,13 +305,17 @@ def parse_args():
 
 def main():
     args = parse_args()
+    db_password = resolve_db_password(
+        password_file=args.db_password_file,
+        prompt=args.prompt_db_password,
+    )
     downloader = PDFDownloader(
         db_url=args.db_url,
         db_host=args.db_host,
         db_port=args.db_port,
         db_name=args.db_name,
         db_user=args.db_user,
-        db_password=args.db_password,
+        db_password=db_password,
         pdf_base_path=args.pdf_path,
         delay=args.delay,
         retries=args.retries,

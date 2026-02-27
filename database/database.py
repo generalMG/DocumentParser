@@ -7,6 +7,8 @@ from sqlalchemy.orm import sessionmaker, Session
 from contextlib import contextmanager
 from typing import Generator, Optional
 import os
+from pathlib import Path
+import getpass
 
 
 def build_db_url(
@@ -161,3 +163,31 @@ def get_database_url_from_env() -> str:
         db_user=db_user,
         db_password=db_password,
     )
+
+
+def resolve_db_password(
+    password_file: Optional[str] = None,
+    prompt: bool = False,
+    env_var: str = "DB_PASSWORD",
+) -> str:
+    """
+    Resolve database password without exposing it in command-line arguments.
+
+    Resolution order:
+    1. `password_file` contents (first line, stripped)
+    2. Environment variable (`DB_PASSWORD` by default)
+    3. Interactive prompt (if `prompt=True`)
+    4. Empty string
+    """
+    if password_file:
+        password_path = Path(password_file).expanduser()
+        return password_path.read_text(encoding="utf-8").strip()
+
+    env_value = os.getenv(env_var)
+    if env_value:
+        return env_value
+
+    if prompt:
+        return getpass.getpass("PostgreSQL password: ")
+
+    return ""

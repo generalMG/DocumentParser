@@ -31,7 +31,7 @@ except ImportError:
     sys.exit(1)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from database.database import DatabaseManager
+from database.database import DatabaseManager, resolve_db_password
 from database.models import ArxivPaper
 
 load_dotenv(override=True)
@@ -291,9 +291,22 @@ def main():
     parser.add_argument("--db-port", type=int, default=int(os.getenv("DB_PORT", "5432")))
     parser.add_argument("--db-name", default=os.getenv("DB_NAME", "arxiv"))
     parser.add_argument("--db-user", default=os.getenv("DB_USER", "postgres"))
-    parser.add_argument("--db-password", default=os.getenv("DB_PASSWORD", ""))
+    parser.add_argument(
+        "--db-password-file",
+        default=os.getenv("DB_PASSWORD_FILE"),
+        help="Read database password from this file path",
+    )
+    parser.add_argument(
+        "--prompt-db-password",
+        action="store_true",
+        help="Prompt for database password securely",
+    )
 
     args = parser.parse_args()
+    db_password = resolve_db_password(
+        password_file=args.db_password_file,
+        prompt=args.prompt_db_password,
+    )
 
     # Connect to database
     db = DatabaseManager(
@@ -302,7 +315,7 @@ def main():
         db_port=args.db_port,
         db_name=args.db_name,
         db_user=args.db_user,
-        db_password=args.db_password,
+        db_password=db_password,
     )
     db.create_engine_and_session()
 
