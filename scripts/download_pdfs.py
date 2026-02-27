@@ -27,6 +27,7 @@ load_dotenv(override=True)
 
 from database.database import DatabaseManager  # noqa: E402
 from database.models import ArxivPaper  # noqa: E402
+from database.path_security import normalize_arxiv_id, safe_pdf_path  # noqa: E402
 
 
 class PDFDownloader:
@@ -66,7 +67,8 @@ class PDFDownloader:
         self.session.headers.update({"User-Agent": "arxiv-pdf-downloader/1.0"})
 
     def build_pdf_url(self, arxiv_id: str) -> str:
-        return urljoin("https://arxiv.org/", f"pdf/{arxiv_id}.pdf")
+        normalized_id = normalize_arxiv_id(arxiv_id)
+        return urljoin("https://arxiv.org/", f"pdf/{normalized_id}.pdf")
 
     def download_pdf(self, arxiv_id: str, dest_path: Path) -> Optional[str]:
         url = self.build_pdf_url(arxiv_id)
@@ -121,9 +123,15 @@ class PDFDownloader:
 
         print(f"Found {len(candidates)} candidates to download")
         for idx, paper_id in enumerate(candidates, 1):
-            dest = self.pdf_base_path / f"{paper_id}.pdf"
             started_at = datetime.utcnow()
-            err = self.download_pdf(paper_id, dest)
+            try:
+                normalized_id = normalize_arxiv_id(paper_id)
+                dest = safe_pdf_path(self.pdf_base_path, normalized_id)
+            except ValueError as exc:
+                normalized_id = None
+                err = f"Unsafe arXiv ID for filesystem path: {exc}"
+            else:
+                err = self.download_pdf(normalized_id, dest)
 
             with self.db_manager.session_scope() as session:
                 db_paper = session.get(ArxivPaper, paper_id)

@@ -25,6 +25,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from database.database import DatabaseManager
 from database.models import ArxivPaper, ArxivCategory, ArxivPaperCategory
+from database.path_security import safe_pdf_filename
 
 
 class ArxivLoader:
@@ -66,7 +67,7 @@ class ArxivLoader:
         Returns:
             Full path to the PDF file
         """
-        return f"{self.pdf_base_path}/{arxiv_id}.pdf"
+        return str(Path(self.pdf_base_path) / safe_pdf_filename(arxiv_id))
 
     def parse_record(self, json_line: str) -> Optional[Dict[str, Any]]:
         """
