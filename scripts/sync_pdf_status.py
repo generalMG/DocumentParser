@@ -20,6 +20,7 @@ load_dotenv(override=True)
 
 from database.database import DatabaseManager
 from database.models import ArxivPaper  # noqa: E402
+from database.path_security import safe_pdf_path  # noqa: E402
 
 
 class PDFSyncer:
@@ -49,15 +50,13 @@ class PDFSyncer:
         print(f"✓ Connected to database: {engine_url}")
         print(f"PDF base path: {self.pdf_base_path}")
 
-    def resolve_path(self, pdf_path: Optional[str], paper_id: str) -> Path:
-        """Resolve the path to a PDF for a paper."""
-        if pdf_path:
-            candidate = Path(pdf_path)
-            if not candidate.is_absolute():
-                candidate = self.pdf_base_path / candidate
-        else:
-            candidate = self.pdf_base_path / f"{paper_id}.pdf"
-        return candidate
+    def resolve_path(self, paper_id: str) -> Path:
+        """
+        Resolve the expected PDF path under the configured base directory.
+
+        We intentionally do not trust database-stored paths for filesystem probes.
+        """
+        return safe_pdf_path(self.pdf_base_path, paper_id)
 
     def sync(self):
         """Scan PDFs and update pdf_downloaded flags."""
@@ -78,8 +77,13 @@ class PDFSyncer:
 
                 for paper in batch:
                     total += 1
-                    path = self.resolve_path(paper.pdf_path, paper.id)
-                    exists = path.exists()
+                    try:
+                        path = self.resolve_path(paper.id)
+                    except ValueError as exc:
+                        print(f"\nWarning: skipped unsafe paper ID '{paper.id}': {exc}")
+                        exists = False
+                    else:
+                        exists = path.exists()
 
                     if exists != paper.pdf_downloaded:
                         paper.pdf_downloaded = exists
