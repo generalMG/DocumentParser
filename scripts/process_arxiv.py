@@ -47,6 +47,7 @@ class ArxivProcessor:
         workers: int = 4,
         retries: int = 3,
         timeout: float = 30.0,
+        max_pdf_size_mb: float = 100.0,
     ):
         """Initialize the ArXiv processor."""
         self.db_url = db_url or get_database_url_from_env()
@@ -55,6 +56,7 @@ class ArxivProcessor:
         self.workers = workers
         self.retries = retries
         self.timeout = timeout
+        self.max_pdf_size_bytes = int(max_pdf_size_mb * 1024 * 1024)
 
         self.db_manager = DatabaseManager(db_url=self.db_url)
         self.db_manager.create_engine_and_session()
@@ -62,6 +64,49 @@ class ArxivProcessor:
         print(f"✓ Database: {self.db_manager.engine.url.render_as_string(hide_password=True)}")
         print(f"✓ ArXiv metadata: {self.arxiv_json_path}")
         print(f"✓ Workers: {self.workers}, Delay: {self.download_delay}s")
+        print(f"✓ Max PDF size: {max_pdf_size_mb:.1f} MB")
+
+    @staticmethod
+    def _is_pdf_content_type(content_type: Optional[str]) -> bool:
+        """Allow PDF and generic binary content types."""
+        if not content_type:
+            return True
+        lowered = content_type.lower()
+        return "pdf" in lowered or "octet-stream" in lowered
+
+    def _read_bounded_pdf(self, response: requests.Response) -> bytes:
+        """Read response content with a strict size cap and PDF signature check."""
+        content_length = response.headers.get("Content-Length")
+        if content_length:
+            try:
+                if int(content_length) > self.max_pdf_size_bytes:
+                    raise ValueError(
+                        f"PDF exceeds size limit ({content_length} > {self.max_pdf_size_bytes} bytes)"
+                    )
+            except ValueError as exc:
+                # Re-raise only if this came from our explicit limit check.
+                if "PDF exceeds size limit" in str(exc):
+                    raise
+
+        chunks: List[bytes] = []
+        total_bytes = 0
+        signature = b""
+        for chunk in response.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            total_bytes += len(chunk)
+            if total_bytes > self.max_pdf_size_bytes:
+                raise ValueError(f"PDF exceeds size limit ({self.max_pdf_size_bytes} bytes)")
+
+            if len(signature) < 5:
+                need = 5 - len(signature)
+                signature += chunk[:need]
+
+            chunks.append(chunk)
+
+        if not signature.startswith(b"%PDF-"):
+            raise ValueError("Downloaded payload is not a PDF")
+        return b"".join(chunks)
 
     def run_migrations(self):
         """Run Alembic migrations to ensure schema is up to date."""
@@ -249,12 +294,17 @@ class ArxivProcessor:
 
         for attempt in range(1, self.retries + 1):
             try:
-                resp = session_http.get(url, timeout=self.timeout, stream=True)
-                if resp.status_code == 200:
-                    pdf_bytes = resp.content
-                    return (paper_id, True, None, pdf_bytes)
-                else:
-                    last_error = f"HTTP {resp.status_code}"
+                with session_http.get(url, timeout=self.timeout, stream=True) as resp:
+                    if resp.status_code == 200:
+                        content_type = resp.headers.get("Content-Type")
+                        if not self._is_pdf_content_type(content_type):
+                            last_error = f"Unexpected content type: {content_type}"
+                            continue
+
+                        pdf_bytes = self._read_bounded_pdf(resp)
+                        return (paper_id, True, None, pdf_bytes)
+                    else:
+                        last_error = f"HTTP {resp.status_code}"
             except Exception as e:
                 last_error = str(e)
 
@@ -483,6 +533,12 @@ Examples:
         default=None,
         help='Database URL (default: from .env SQLALCHEMY_URL)'
     )
+    parser.add_argument(
+        '--max-pdf-size-mb',
+        type=float,
+        default=float(os.getenv('MAX_PDF_SIZE_MB', '100')),
+        help='Maximum PDF size to download per paper in MB (default: 100)'
+    )
 
     args = parser.parse_args()
 
@@ -494,7 +550,8 @@ Examples:
         db_url=args.db_url,
         arxiv_json_path=args.arxiv_json,
         download_delay=delay,
-        workers=args.workers
+        workers=args.workers,
+        max_pdf_size_mb=args.max_pdf_size_mb,
     )
 
     # Run processing pipeline

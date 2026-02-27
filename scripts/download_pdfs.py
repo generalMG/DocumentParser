@@ -43,10 +43,12 @@ class PDFDownloader:
         delay: float = 3.0,
         retries: int = 3,
         timeout: float = 30.0,
+        max_pdf_size_mb: float = 100.0,
     ):
         self.delay = delay
         self.retries = retries
         self.timeout = timeout
+        self.max_pdf_size_bytes = int(max_pdf_size_mb * 1024 * 1024)
         self.pdf_base_path = Path(pdf_base_path)
         self.pdf_base_path.mkdir(parents=True, exist_ok=True)
 
@@ -62,9 +64,17 @@ class PDFDownloader:
         engine_url = self.db_manager.engine.url.render_as_string(hide_password=True)
         print(f"✓ Connected to database: {engine_url}")
         print(f"PDF base path: {self.pdf_base_path}")
+        print(f"Max PDF size: {max_pdf_size_mb:.1f} MB")
 
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "arxiv-pdf-downloader/1.0"})
+
+    @staticmethod
+    def _is_pdf_content_type(content_type: Optional[str]) -> bool:
+        if not content_type:
+            return True
+        lowered = content_type.lower()
+        return "pdf" in lowered or "octet-stream" in lowered
 
     def build_pdf_url(self, arxiv_id: str) -> str:
         normalized_id = normalize_arxiv_id(arxiv_id)
@@ -74,19 +84,58 @@ class PDFDownloader:
         url = self.build_pdf_url(arxiv_id)
         last_error = None
         for attempt in range(1, self.retries + 1):
+            tmp_path = dest_path.with_name(f"{dest_path.name}.part")
             try:
-                resp = self.session.get(url, timeout=self.timeout, stream=True)
-                if resp.status_code == 200:
+                with self.session.get(url, timeout=self.timeout, stream=True) as resp:
+                    if resp.status_code != 200:
+                        last_error = f"HTTP {resp.status_code}"
+                        continue
+
+                    content_type = resp.headers.get("Content-Type")
+                    if not self._is_pdf_content_type(content_type):
+                        last_error = f"Unexpected content type: {content_type}"
+                        continue
+
+                    content_length = resp.headers.get("Content-Length")
+                    if content_length:
+                        try:
+                            if int(content_length) > self.max_pdf_size_bytes:
+                                raise ValueError(
+                                    f"PDF exceeds size limit ({content_length} > {self.max_pdf_size_bytes} bytes)"
+                                )
+                        except ValueError as exc:
+                            if "PDF exceeds size limit" in str(exc):
+                                raise
+
+                    total_bytes = 0
+                    signature = b""
                     dest_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(dest_path, "wb") as f:
+                    with open(tmp_path, "wb") as f:
                         for chunk in resp.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
+                            if not chunk:
+                                continue
+
+                            total_bytes += len(chunk)
+                            if total_bytes > self.max_pdf_size_bytes:
+                                raise ValueError(
+                                    f"PDF exceeds size limit ({self.max_pdf_size_bytes} bytes)"
+                                )
+
+                            if len(signature) < 5:
+                                need = 5 - len(signature)
+                                signature += chunk[:need]
+
+                            f.write(chunk)
+
+                    if not signature.startswith(b"%PDF-"):
+                        raise ValueError("Downloaded payload is not a PDF")
+
+                    tmp_path.replace(dest_path)
                     return None
-                else:
-                    last_error = f"HTTP {resp.status_code}"
             except Exception as e:
                 last_error = str(e)
+                if tmp_path.exists():
+                    tmp_path.unlink()
 
             if attempt < self.retries:
                 time.sleep(self.delay)
@@ -220,6 +269,12 @@ def parse_args():
         help="HTTP request timeout (seconds)",
     )
     parser.add_argument(
+        "--max-pdf-size-mb",
+        type=float,
+        default=float(os.getenv("MAX_PDF_SIZE_MB", "100")),
+        help="Maximum PDF size to download per paper in MB (default: 100)",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=100,
@@ -256,6 +311,7 @@ def main():
         delay=args.delay,
         retries=args.retries,
         timeout=args.timeout,
+        max_pdf_size_mb=args.max_pdf_size_mb,
     )
     downloader.categories = args.categories
     downloader.run(limit=args.limit, auto_commit=args.auto, include_errors=args.retry_errors)
