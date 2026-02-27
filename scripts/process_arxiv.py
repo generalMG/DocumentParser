@@ -135,11 +135,26 @@ class ArxivProcessor:
         except json.JSONDecodeError:
             return None
 
-    def get_existing_paper_ids(self) -> set:
-        """Get all paper IDs that are already in the database."""
+    def _filter_existing_papers(self, papers: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], int]:
+        """
+        Remove papers that already exist in the database.
+
+        Returns:
+            (papers_to_insert, skipped_count)
+        """
+        if not papers:
+            return [], 0
+
+        paper_ids = [paper['id'] for paper in papers]
         with self.db_manager.get_session() as session:
-            result = session.query(ArxivPaper.id).all()
-            return {row[0] for row in result}
+            existing = session.query(ArxivPaper.id).filter(ArxivPaper.id.in_(paper_ids)).all()
+            existing_ids = {row[0] for row in existing}
+
+        if not existing_ids:
+            return papers, 0
+
+        filtered = [paper for paper in papers if paper['id'] not in existing_ids]
+        return filtered, len(existing_ids)
 
     def load_metadata(self, limit: Optional[int] = None, batch_size: int = 2000, resume: bool = True):
         """
@@ -160,12 +175,8 @@ class ArxivProcessor:
         if not Path(self.arxiv_json_path).exists():
             raise FileNotFoundError(f"ArXiv metadata file not found: {self.arxiv_json_path}")
 
-        # Get existing paper IDs if resuming
-        existing_ids = set()
         if resume:
-            print("Checking for existing papers in database...")
-            existing_ids = self.get_existing_paper_ids()
-            print(f"✓ Found {len(existing_ids)} papers already in database")
+            print("Resume mode enabled: existing papers will be skipped via batch checks")
 
         loaded_ids = []
         skipped_count = 0
@@ -173,7 +184,6 @@ class ArxivProcessor:
 
         with open(self.arxiv_json_path, 'r', encoding='utf-8') as f:
             batch_papers = []
-            batch_categories = set()
 
             for line in tqdm(f, desc="Loading metadata", unit=" records"):
                 if limit and total_processed >= limit:
@@ -187,14 +197,8 @@ class ArxivProcessor:
                 if not paper_id:
                     continue
 
-                # Skip if already exists and we're resuming
-                if resume and paper_id in existing_ids:
-                    skipped_count += 1
-                    continue
-
                 # Parse categories
                 categories_str = record.get('categories', '')
-                categories_list = [cat.strip() for cat in categories_str.split() if cat.strip()]
 
                 # Prepare paper data
                 paper_data = {
@@ -215,19 +219,56 @@ class ArxivProcessor:
                 }
 
                 batch_papers.append(paper_data)
-                batch_categories.update(categories_list)
-                loaded_ids.append(paper_id)
-                total_processed += 1
-
                 # Process batch
                 if len(batch_papers) >= batch_size:
-                    self._insert_batch(batch_papers, batch_categories)
+                    papers_to_insert = batch_papers
+                    if resume:
+                        papers_to_insert, skipped = self._filter_existing_papers(batch_papers)
+                        skipped_count += skipped
+
+                    if papers_to_insert:
+                        if limit:
+                            remaining = limit - total_processed
+                            if remaining <= 0:
+                                break
+                            papers_to_insert = papers_to_insert[:remaining]
+
+                        insert_categories = {
+                            cat
+                            for paper in papers_to_insert
+                            for cat in paper['categories'].split()
+                            if cat
+                        }
+                        self._insert_batch(papers_to_insert, insert_categories)
+                        inserted_ids = [paper['id'] for paper in papers_to_insert]
+                        loaded_ids.extend(inserted_ids)
+                        total_processed += len(inserted_ids)
+
                     batch_papers = []
-                    batch_categories = set()
 
             # Insert remaining records
             if batch_papers:
-                self._insert_batch(batch_papers, batch_categories)
+                papers_to_insert = batch_papers
+                if resume:
+                    papers_to_insert, skipped = self._filter_existing_papers(batch_papers)
+                    skipped_count += skipped
+
+                if papers_to_insert:
+                    if limit:
+                        remaining = limit - total_processed
+                        papers_to_insert = papers_to_insert[:max(0, remaining)]
+
+                    if papers_to_insert:
+                        insert_categories = {
+                            cat
+                            for paper in papers_to_insert
+                            for cat in paper['categories'].split()
+                            if cat
+                        }
+                        self._insert_batch(papers_to_insert, insert_categories)
+                        inserted_ids = [paper['id'] for paper in papers_to_insert]
+                        loaded_ids.extend(inserted_ids)
+                        total_processed += len(inserted_ids)
 
         print(f"✓ Loaded {total_processed} new metadata records")
         if skipped_count > 0:
