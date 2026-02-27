@@ -542,6 +542,13 @@ Examples:
 
     args = parser.parse_args()
 
+    if args.workers < 1:
+        parser.error('--workers must be >= 1')
+    if args.max_pdf_size_mb <= 0:
+        parser.error('--max-pdf-size-mb must be > 0')
+    if args.limit is not None and args.limit < 1:
+        parser.error('--limit must be >= 1 when provided')
+
     # Get download delay from args or env
     delay = args.delay or float(os.getenv('DOWNLOAD_DELAY', '3.0'))
 

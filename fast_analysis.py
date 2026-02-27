@@ -44,11 +44,20 @@ def read_in_chunks(file_path, chunk_size=50000):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Analyze arXiv metadata JSON file')
+    default_cpu = max(1, cpu_count() // 4)
     parser.add_argument('file_path', nargs='?', default='./arxiv-metadata-oai-snapshot.json',
                         help='Path to the arXiv metadata JSON file (default: ./arxiv-metadata-oai-snapshot.json)')
-    parser.add_argument('--cpu_count', type=int, default=cpu_count() // 4,
+    parser.add_argument('--cpu_count', type=int, default=default_cpu,
                         help='Number of CPU cores to use (default: quarter of available cores)')
     args = parser.parse_args()
+
+    if args.cpu_count < 1:
+        parser.error('--cpu_count must be >= 1')
+
+    max_cpus = cpu_count()
+    if args.cpu_count > max_cpus:
+        print(f"Requested --cpu_count {args.cpu_count} exceeds available CPUs ({max_cpus}); using {max_cpus}.")
+        args.cpu_count = max_cpus
 
     file_path = args.file_path
 
