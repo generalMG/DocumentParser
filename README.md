@@ -1,6 +1,6 @@
 # ArXiv Database Project
 
-Python tooling for loading the arXiv metadata snapshot into PostgreSQL, storing PDFs directly in the database, and running a PaddleOCR-VL pipeline (service + client + visualization).
+Python tooling for loading the arXiv metadata snapshot into PostgreSQL, storing PDFs directly in the database, and running a PaddleOCR-VL pipeline (worker + visualization).
 
 ## What you can do
 - **Process arXiv papers end-to-end** with a unified script (`scripts/process_arxiv.py`)
@@ -8,8 +8,8 @@ Python tooling for loading the arXiv metadata snapshot into PostgreSQL, storing 
   - Download PDFs directly into the database (BYTEA storage)
   - Concurrent downloads with rate limiting
   - Resume from where you left off automatically
-- Run a FastAPI PaddleOCR-VL service (GPU or CPU) with concurrent workers
-- Extract text from PDFs with OCR and store results in the database (`scripts/ocr_client.py`)
+- Run a unified PaddleOCR-VL worker (GPU or CPU) with concurrent model workers (`scripts/ocr_worker.py`)
+- Extract text from PDFs with OCR and store results directly in the database
 - Visualize OCR layout boxes and extracted text side-by-side (`scripts/visualize_ocr.py`)
 - Quickly explore the metadata snapshot and plot year/version trends (`fast_analysis.py`)
 
@@ -25,7 +25,7 @@ Install dependencies:
 python -m venv .venv && source .venv/bin/activate  # optional but recommended
 pip install -r requirements.txt
 ```
-`fastapi`, `uvicorn`, `requests`, `PyPDF2`, `pdf2image`, `reportlab`, and PaddleOCR packages are needed for the OCR pipeline.
+`requests`, `PyPDF2`, `pdf2image`, `reportlab`, and PaddleOCR packages are needed for the OCR pipeline.
 ### Recommendation
 Use `uv package manager` for faster and more reliable installation.
 
@@ -172,62 +172,35 @@ python scripts/load_pdfs_to_db.py --limit 1000
 python scripts/sync_pdf_status.py
 ```
 
-## PaddleOCR-VL Service
-
-Start the OCR service with GPU workers:
-```bash
-# GPU with 3 concurrent workers
-python scripts/ocr_service.py --host 0.0.0.0 --port 8000 --device gpu:0 --workers 3
-
-# CPU fallback (single worker recommended)
-python scripts/ocr_service.py --device cpu --workers 1
-```
-
-### Service features
-- FastAPI app with process pool; each worker preloads PaddleOCR-VL and runs warm-up
-- **Endpoints**:
-  - `/health` - Health check
-  - `/info` - Service info (worker count, device, pool status)
-  - `/ocr` - Process whole PDFs (optionally limited by `pages` form field)
-  - `/ocr_page` - Process a single page from a PDF (returns `total_pages`)
-  - `/ocr_image` - Process a single pre-rendered page image (PNG/JPEG) to avoid repeated PDF rendering
-- Filters out image blobs for lean JSON output
-- Injects DPI info for coordinate accuracy
-- Automatic GPU memory cleanup after each page (prevents VRAM leaks)
-- IoU-based bounding box matching for accurate text-to-box alignment
-- Monkeypatches `safetensors.safe_open` to handle bfloat16 Paddle models via torch backend
-
-## OCR Client (Database Storage)
+## OCR Worker (Database Storage)
 
 Extract text from PDFs and store results directly in the database:
 ```bash
-# Process 100 papers (auto-detects GPU workers from service)
-python scripts/ocr_client.py --limit 100
+# Process 100 papers with 1 model worker on GPU 0
+python scripts/ocr_worker.py --limit 100 --device gpu:0 --workers 1
+
+# CPU fallback
+python scripts/ocr_worker.py --limit 20 --device cpu --workers 1
 
 # Limit pages per PDF
-python scripts/ocr_client.py --limit 100 --pages 10
+python scripts/ocr_worker.py --limit 100 --pages 10
 
-# Cap rendered pages to avoid OOM on huge PDFs (default 100)
-python scripts/ocr_client.py --limit 100 --render-page-limit 100
+# Cap rendered pages to avoid OOM on huge PDFs
+python scripts/ocr_worker.py --limit 100 --render-page-limit 100
 
-# Throttle per-batch processing to reduce GPU/CPU spikes (default batch size 8)
-python scripts/ocr_client.py --limit 100 --page-batch-size 4 --gpu-workers 1
-
-# Override worker count
-python scripts/ocr_client.py --limit 100 --gpu-workers 2
+# Tune throughput and memory pressure
+python scripts/ocr_worker.py --limit 100 --page-batch-size 4 --render-workers 2
 
 # Retry previously failed papers
-python scripts/ocr_client.py --limit 100 --retry-errors
+python scripts/ocr_worker.py --limit 100 --retry-errors
 ```
 
-### Client features
-- **Database storage**: OCR results saved as JSONB directly in PostgreSQL (no local files)
-- **Client-side rendering**: Pre-renders PDF pages to images once, cutting bandwidth ~25x vs sending PDFs repeatedly
-- **CPU/GPU pipeline**: Prefetches next-PDF metadata while GPU OCR runs on the current one, caps rendering to 100 pages by default, and batches pages (default 8/page batch) to reduce GPU/CPU spikes
-- **Concurrent page processing**: Processes N pages simultaneously (auto-detects from service)
-- **Resume support**: Automatically resumes from last processed page if interrupted
-- **Progress tracking**: Clean per-paper logging with page progress
-- **Error handling**: Tracks errors in `ocr_error` column for debugging
+### Worker features
+- **Database storage**: OCR results saved as JSONB directly in PostgreSQL
+- **Process isolation**: Model inference runs in dedicated worker processes
+- **Bounded pipeline controls**: Page limits, batch sizing, and render-worker controls
+- **Resume support**: Continues from previously stored partial OCR results
+- **Progress/error tracking**: Uses `ocr_processed`, `ocr_processed_at`, and `ocr_error`
 
 ### OCR database columns
 | Column | Type | Description |
@@ -300,9 +273,9 @@ scripts/
   download_pdfs.py     # Legacy: Download PDFs to filesystem
   load_pdfs_to_db.py   # Legacy: Load filesystem PDFs into database
   sync_pdf_status.py   # Legacy: Reconcile pdf_downloaded flags
-  ocr_service.py       # FastAPI PaddleOCR-VL service
-  ocr_client.py        # OCR client with database storage
+  ocr_worker.py        # Unified OCR worker (render + inference + DB writes)
   visualize_ocr.py     # Visualize OCR results from database
+  compute_perplexity.py# Evaluate OCR text quality via perplexity
 fast_analysis.py       # Parallel metadata explorer
 schema.sql             # Reference DDL (mirrors Alembic head)
 requirements.txt
@@ -316,8 +289,8 @@ README.md
 - **Respect arXiv rate limits**: Default delay is 3 seconds between downloads. Do not decrease below 2 seconds
 - **Resume behavior**: The unified script automatically resumes from where it left off. To reload existing papers, use `--no-resume`
 - **Concurrent downloads**: More workers = faster processing, but respect rate limits. Recommended: 4-8 workers
-- **OCR models**: The OCR service expects models under `~/.paddlex/official_models` by default; first run will download them
-- **GPU memory**: The OCR service includes automatic memory cleanup to prevent VRAM leaks during long runs
+- **OCR models**: The OCR worker expects models under `~/.paddlex/official_models` by default; first run will download them
+- **GPU memory**: The OCR worker includes automatic memory cleanup and worker recycling for long runs
 
 ## Storage comparison
 - **Filesystem**: ~3.7GB for 10k PDFs on disk
