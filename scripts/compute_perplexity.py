@@ -254,11 +254,18 @@ def compute_perplexity_sliding_window(
     }
 
 
-def load_model(model_name: str, device: str = "cuda") -> tuple:
+def load_model(model_name: str, device: str = "cuda", allow_remote_code: bool = False) -> tuple:
     """Load model and tokenizer from HuggingFace."""
     logger.info(f"Loading model: {model_name}")
+    if allow_remote_code:
+        logger.warning(
+            "Remote model code execution is enabled. Only use trusted, pinned model repositories."
+        )
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=allow_remote_code,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -267,7 +274,7 @@ def load_model(model_name: str, device: str = "cuda") -> tuple:
         model_name,
         torch_dtype=torch.float16,
         device_map="auto",  # Automatic device placement
-        trust_remote_code=True,
+        trust_remote_code=allow_remote_code,
     )
     model.eval()
 
@@ -314,6 +321,11 @@ def main():
     parser.add_argument('--show-worst', type=int, default=5,
                         help="Show N worst chunks")
     parser.add_argument('--device', type=str, default="cuda", help="Compute device")
+    parser.add_argument(
+        '--allow-remote-code',
+        action='store_true',
+        help='Allow execution of model-provided remote code (unsafe; disabled by default)',
+    )
     args = parser.parse_args()
 
     # Initialize database
@@ -345,7 +357,7 @@ def main():
     logger.info(f"Text preview: {preview}...")
 
     # Load model
-    model, tokenizer = load_model(args.model, args.device)
+    model, tokenizer = load_model(args.model, args.device, args.allow_remote_code)
 
     # Compute perplexity
     logger.info("Computing perplexity with sliding window...")
